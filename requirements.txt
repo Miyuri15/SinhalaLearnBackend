@@ -30,5 +30,8 @@ google-genai
 python-multipart
 
 ultralytics
-modal
+
 sinling
+tzdata
+modal
+
