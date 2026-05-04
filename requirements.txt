@@ -29,3 +29,4 @@ python-multipart
 
 ultralytics
 sinling
+tzdata
