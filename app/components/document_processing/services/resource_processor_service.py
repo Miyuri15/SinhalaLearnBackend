@@ -231,6 +231,7 @@ class ResourceProcessorService:
             ml_model_predict=ml_model_predict,
             ml_conf_threshold=self.text_type_conf_threshold,
             trocr_predict=self.handwritten_ocr_predictor,
+            is_image_upload=False,
             region_conf_threshold=self.text_type_conf_threshold,
         )
 
@@ -320,6 +321,7 @@ class ResourceProcessorService:
             ml_model_predict=ml_model_predict,
             ml_conf_threshold=self.text_type_conf_threshold,
             trocr_predict=self.handwritten_ocr_predictor,
+            is_image_upload=True,
             region_conf_threshold=self.text_type_conf_threshold,
         )
 

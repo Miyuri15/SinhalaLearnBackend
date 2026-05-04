@@ -1,3 +1,5 @@
+# scripts/modal_trocr_service.py
+
 import base64
 import io
 import os
@@ -7,7 +9,7 @@ import modal
 from fastapi import Request
 
 
-MODEL_NAME = "hasindu-k/sinhala-handwritten-notes-v2"
+MODEL_NAME = os.environ.get("TROCR_MODEL_NAME", "hasindu-k/sinhala-handwritten-notes-v3")
 
 app = modal.App("sinhala-trocr-service")
 
@@ -30,8 +32,8 @@ def load_model():
     from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor = TrOCRProcessor.from_pretrained(MODEL_NAME)
-    model = VisionEncoderDecoderModel.from_pretrained(MODEL_NAME)
+    processor = TrOCRProcessor.from_pretrained(TROCR_MODEL_NAME)
+    model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL_NAME)
     model.to(device)
     model.eval()
     return processor, model, device
@@ -40,7 +42,7 @@ def load_model():
 @app.function(
     image=image,
     gpu="T4",
-    scaledown_window=300,
+    scaledown_window=180,
     timeout=120,
 )
 @modal.fastapi_endpoint(method="POST")

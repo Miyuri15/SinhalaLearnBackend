@@ -138,7 +138,9 @@ def trocr_predict(image_crop: np.ndarray, tess_lang: Optional[str] = None) -> st
 
     if image_crop is None or image_crop.size == 0:
         return ""
-
+    
+    logger.info("Predicting text with TrOCR backend '%s'", TROCR_BACKEND)
+    
     if TROCR_BACKEND == "local":
         return _predict_local(image_crop)
     if TROCR_BACKEND in {"http", "modal"}:

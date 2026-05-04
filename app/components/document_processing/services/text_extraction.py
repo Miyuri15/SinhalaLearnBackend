@@ -196,6 +196,7 @@ def process_ocr_for_images_with_tables(
     ml_model_predict: Optional[Callable[[np.ndarray], TextTypeResult]] = None,
     ml_conf_threshold: float = 0.7,
     trocr_predict: Optional[Callable[[np.ndarray], str]] = None,
+    is_image_upload: bool = True,
     region_conf_threshold: float = 0.7,
 ) -> tuple:
     print(f"LANG VALUE: {lang}")
@@ -343,7 +344,8 @@ def process_ocr_for_images_with_tables(
                 crop = gray[y1:y2, x1:x2]
 
                 use_trocr = (
-                    trocr_predict is not None
+                    is_image_upload
+                    and trocr_predict is not None
                     and region_text_type == "handwritten"
                     and region_confidence >= region_conf_threshold
                 )
@@ -383,7 +385,8 @@ def process_ocr_for_images_with_tables(
                 return_confidence=True,
             )
             use_trocr = (
-                trocr_predict is not None
+                is_image_upload
+                and trocr_predict is not None
                 and page_text_type == "handwritten"
                 and page_confidence >= region_conf_threshold
             )
