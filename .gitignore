@@ -136,6 +136,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
@@ -143,6 +144,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+venv_old/
 
 # Spyder project settings
 .spyderproject
@@ -211,6 +213,7 @@ config/firebase_service_account.json
 
 #model
 app/models/whisper-sinhala-accent-model/
+app/models/whisper-small-sinhala-robust-FINAL/
 uploads/
 
 logs/

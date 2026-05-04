@@ -61,6 +61,7 @@ class ResourceProcessorService:
         resource_type: Optional[str] = None,
         progress_callback: Optional[Callable[[str, float, Optional[Dict[str, Any]]], None]] = None
     ) -> tuple[str, int, str]:
+        print("🔥 ENTERED _extract_text")
         """
         Extract text from PDF or image file.
 
@@ -78,6 +79,8 @@ class ResourceProcessorService:
             detect_language_from_text,
         )
         from app.components.document_processing.utils.text_cleaner import basic_clean
+        
+        print("🔥 Imports done")
 
         file_ext = Path(file_path).suffix.lower()
 
@@ -88,6 +91,13 @@ class ResourceProcessorService:
                 progress_callback("Preparing Document", 4.0, None)
 
             if file_ext == ".pdf":
+                
+                print(f"convert_file_to_images: {convert_file_to_images}")
+                print(f"extract_text_from_pdf: {extract_text_from_pdf}")
+                print(f"process_ocr_for_images_with_tables: {process_ocr_for_images_with_tables}")
+                print(f"classify_text_type: {classify_text_type}")
+                print(f"detect_language_from_text: {detect_language_from_text}")
+                print(f"basic_clean: {basic_clean}")
 
                 result = self._process_pdf(
                     file_path,
@@ -142,6 +152,7 @@ class ResourceProcessorService:
         resource_type: Optional[str] = None,
         progress_callback: Optional[Callable[[str, float, Optional[Dict[str, Any]]], None]] = None
     ):
+        print("🔥 ENTERED _process_pdf")
 
         # Stage: Detect language from PDF metadata
         if progress_callback:
@@ -171,7 +182,8 @@ class ResourceProcessorService:
         # OCR fallback
         if progress_callback:
             progress_callback("Converting PDF to Images", 8.0, None)
-
+            
+        print("➡️ Calling convert_file_to_images")
         images = convert_file_to_images(file_path, "pdf")
         ml_model_predict = self._resolve_ml_model_predict()
 
@@ -325,6 +337,7 @@ class ResourceProcessorService:
 
     def _try_direct_pdf_extraction(self, file_path, extract_text_from_pdf, basic_clean):
         try:
+            text = extract_text_from_pdf(file_path)
             extracted_text, page_count = extract_text_from_pdf(file_path)
 
             if extracted_text.strip():

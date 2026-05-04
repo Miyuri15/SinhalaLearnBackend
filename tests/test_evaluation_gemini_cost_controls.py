@@ -52,8 +52,135 @@ def test_single_pass_answer_mapping_uses_one_gemini_call(monkeypatch):
     assert result == {"q-1": "1. student answer"}
     assert len(calls) == 1
     assert calls[0]["budget"] == "answer_mapping"
-    assert calls[0]["reason"] == "single_pass_full_paper"
+    assert calls[0]["reason"] == "answer_mapping_chunk_1_of_1"
     assert calls[0].get("model", classifier_service.EvaluationGeminiClient.ANSWER_MAPPING.model_name) == classifier_service.EvaluationGeminiClient.ANSWER_MAPPING.model_name
+
+
+def test_single_pass_answer_mapping_keeps_unverified_structured_output(monkeypatch):
+    def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
+        return (
+            '{"mappings": ['
+            '{"question_id": "q-2", "label": "2", "answer": "ජේම්ස් හර්ග්‍රීව්ස්.", '
+            '"source_marker": "2.", "confidence": 0.9}'
+            ']}'
+        )
+
+    monkeypatch.setattr(classifier_service, "gemini_generate_evaluation", fake_gemini_generate_evaluation)
+    monkeypatch.setattr(classifier_service, "_has_marker_supported_mapping", lambda *args, **kwargs: False)
+    monkeypatch.setattr(classifier_service, "_is_hallucinated_question_text", lambda *args, **kwargs: False)
+    monkeypatch.setattr(classifier_service, "_get_part_specific_answer_text", lambda text, part: text)
+    monkeypatch.setattr(classifier_service, "_suppress_cross_part_duplicate_mappings", lambda mappings, _: mappings)
+
+    question = SimpleNamespace(
+        id="q-2",
+        question_number="2",
+        part_name="Paper_I",
+        question_text="Who invented the spinning jenny?",
+        sub_questions=[],
+    )
+
+    result = classifier_service.map_student_answers("2. ජේම්ස් හර්ග්‍රීව්ස්.", [question])
+
+    assert result == {"q-2": "ජේම්ස් හර්ග්‍රීව්ස්."}
+
+
+def test_single_pass_answer_mapping_recovers_stale_id_by_unique_label(monkeypatch):
+    def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
+        return (
+            '{"mappings": ['
+            '{"question_id": "stale-id", "label": "2", "answer": "ජේම්ස් හර්ග්‍රීව්ස්.", '
+            '"source_marker": "2.", "confidence": 0.9}'
+            ']}'
+        )
+
+    monkeypatch.setattr(classifier_service, "gemini_generate_evaluation", fake_gemini_generate_evaluation)
+    monkeypatch.setattr(classifier_service, "_has_marker_supported_mapping", lambda *args, **kwargs: True)
+    monkeypatch.setattr(classifier_service, "_is_hallucinated_question_text", lambda *args, **kwargs: False)
+    monkeypatch.setattr(classifier_service, "_get_part_specific_answer_text", lambda text, part: text)
+    monkeypatch.setattr(classifier_service, "_suppress_cross_part_duplicate_mappings", lambda mappings, _: mappings)
+
+    question = SimpleNamespace(
+        id="q-2",
+        question_number="2",
+        part_name="Paper_I",
+        question_text="Who invented the spinning jenny?",
+        sub_questions=[],
+    )
+
+    result = classifier_service.map_student_answers("2. ජේම්ස් හර්ග්‍රීව්ස්.", [question])
+
+    assert result == {"q-2": "ජේම්ස් හර්ග්‍රීව්ස්."}
+
+
+def test_label_recovery_prefers_exact_zero_padded_labels():
+    flat = [
+        {"id": "short-1", "label": "1"},
+        {"id": "long-1", "label": "01"},
+    ]
+    exact_lookup, loose_lookup = classifier_service._build_unique_label_lookup(flat)
+
+    assert classifier_service._resolve_mapping_question_id(
+        {"question_id": "stale", "label": "1"},
+        {},
+        exact_lookup,
+        loose_lookup,
+    ) == ("short-1", "label")
+    assert classifier_service._resolve_mapping_question_id(
+        {"question_id": "stale", "label": "01"},
+        {},
+        exact_lookup,
+        loose_lookup,
+    ) == ("long-1", "label")
+
+
+def test_safe_json_loads_recovers_largest_partial_mapping():
+    parsed = classifier_service._safe_json_loads(
+        'prefix {"mappings": [{"question_id": "q-1", "answer": "1. answer"}'
+    )
+
+    assert parsed == {"mappings": [{"question_id": "q-1", "answer": "1. answer"}]}
+
+
+def test_tolerant_marker_matching_supports_zero_padded_and_sinhala_sub_label():
+    source = "01. (අ) ගල් අඟුරු තිබුණා\n02. ජේම්ස් හර්ග්‍රීව්ස්."
+
+    assert classifier_service._has_direct_marker_supported_mapping(
+        source,
+        "ගල් අඟුරු තිබුණා",
+        "1(අ)",
+    )
+    assert classifier_service._has_direct_marker_supported_mapping(
+        source,
+        "ජේම්ස් හර්ග්‍රීව්ස්.",
+        "2",
+    )
+
+
+def test_local_ocr_marker_fallback_recovers_missing_short_and_sub_answers():
+    flat_structure = [
+        {"id": "short-1", "label": "1", "is_sub_question": False, "has_sub_questions": False},
+        {"id": "short-2", "label": "2", "is_sub_question": False, "has_sub_questions": False},
+        {"id": "main-1", "label": "1", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "sub-1a", "label": "1(a)", "parent_main_label": "1", "is_sub_question": True},
+        {"id": "sub-1b", "label": "1(b)", "parent_main_label": "1", "is_sub_question": True},
+    ]
+    answer_text = (
+        "1. coal and iron. 2. james. "
+        "01. (a) industry started in Britain. (b) worker unions formed."
+    )
+
+    recovered = classifier_service._map_answers_from_visible_ocr_markers(
+        answer_text,
+        flat_structure,
+        existing={"short-1": "already mapped"},
+    )
+
+    assert recovered == {
+        "short-2": "james",
+        "sub-1a": "industry started in Britain",
+        "sub-1b": "worker unions formed",
+    }
+    assert classifier_service._count_visible_ocr_answer_blocks(answer_text) == 4
 
 
 def test_question_parsing_uses_configured_model(monkeypatch):
@@ -377,3 +504,51 @@ def test_normalize_extracted_exam_result_rebalances_plain_questions():
     assert normalized["Paper_II"]["config"]["total_questions_available"] == 3
     assert "3" in normalized["Paper_I"]["questions"]
     assert "3" not in normalized["Paper_II"]["questions"]
+
+
+def test_segment_exam_text_detects_sinhala_shra_paper_headers():
+    text = """
+11 ශ්‍රේණිය - ඉතිහාසය
+
+I ශ්‍රකාටස - ශ්‍රකටි පිළිතුරු ප්‍රශ්න
+1. කෙටි ප්‍රශ්නයකි. (02 ලකුණු)
+2. තවත් කෙටි ප්‍රශ්නයකි. (02 ලකුණු)
+
+II ශ්‍රකාටස - විග්‍රහාත්මක රචනා ප්‍රශ්න
+01.
+(අ) රචනා ප්‍රශ්නයකි. (04 ලකුණු)
+(ආ) තවත් උප ප්‍රශ්නයකි. (04 ලකුණු)
+"""
+
+    sections = classifier_service._segment_exam_text_by_paper_headers(text)
+
+    assert set(sections) == {"Paper_I", "Paper_II"}
+    assert "කෙටි ප්‍රශ්නයකි" in sections["Paper_I"]
+    assert "විග්‍රහාත්මක" in sections["Paper_II"]
+
+
+def test_backfill_missing_segmented_paper_ii_questions():
+    text = """
+I ශ්‍රකාටස - ශ්‍රකටි පිළිතුරු ප්‍රශ්න
+1. කෙටි ප්‍රශ්නයකි. (02 ලකුණු)
+
+II ශ්‍රකාටස - විග්‍රහාත්මක රචනා ප්‍රශ්න
+01.
+(අ) පළමු රචනා උප ප්‍රශ්නය. (04 ලකුණු)
+(ආ) දෙවන උප ප්‍රශ්නය. (04 ලකුණු)
+(ඇ) තුන්වන උප ප්‍රශ්නය. (04 ලකුණු)
+02.
+(අ) දෙවන රචනා ප්‍රශ්නය. (04 ලකුණු)
+03.
+(අ) තුන්වන රචනා ප්‍රශ්නය. (04 ලකුණු)
+"""
+    parsed = {
+        "Paper_I": {"config": {}, "questions": {"1": {"text": "කෙටි ප්‍රශ්නයකි"}}},
+        "Paper_II": {"config": {}, "questions": {"1": {"text": "only one"}}},
+    }
+
+    backfilled = classifier_service._backfill_missing_segmented_questions(parsed, text)
+
+    assert set(backfilled["Paper_II"]["questions"]) == {"1", "2", "3"}
+    assert backfilled["Paper_II"]["config"]["total_questions_available"] == 3
+    assert set(backfilled["Paper_II"]["questions"]["2"]["sub_questions"]) == {"අ"}

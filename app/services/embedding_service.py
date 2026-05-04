@@ -1,5 +1,4 @@
 # app/services/embedding_service.py
-from sentence_transformers import SentenceTransformer
 import numpy as np
 from functools import lru_cache
 
@@ -11,6 +10,8 @@ class EmbeddingService:
         if cls._model is None:
             # Add timeout and retry configuration
             import torch
+            from sentence_transformers import SentenceTransformer
+
             cls._model = SentenceTransformer(
                 "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
                 device='cpu'  # Explicitly set device

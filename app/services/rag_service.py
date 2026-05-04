@@ -51,6 +51,7 @@ class RAGService:
         bm25_k: int = 20,
         final_k: int = 8,
         grade_level: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Dict:
         """Hybrid retrieval → grounded generation → safety checks → logging"""
 
@@ -264,7 +265,13 @@ class RAGService:
         # -----------------------------
         # 9. Generate response with Gemini
         # -----------------------------
-        generated_result = GeminiClient.generate_content(prompt)
+        generated_result = GeminiClient.generate_content(
+            prompt=prompt, 
+            user_id=user_id,
+            session_id=session_id,
+            message_id=user_message_id,
+            service_name="message_generation",
+        )
         generated = generated_result["text"]
         prompt_tokens = generated_result["prompt_tokens"]
         completion_tokens = generated_result["completion_tokens"]

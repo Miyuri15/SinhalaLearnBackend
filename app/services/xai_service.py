@@ -31,6 +31,8 @@ class XAIService:
         "කරයි",
         "කරන",
         "කිරීම",
+        "කරන්න",
+        "කොට",
         "තුළ",
         "ද",
         "දී",
@@ -51,8 +53,11 @@ class XAIService:
         "හා",
         "වේ",
         "දෙන්න",
+        "දුන්නා",
         "ලදී",
         "තවද",
+        "තුමා",
+        "වීම",
     }
     PUNCTUATION = set(string.punctuation) | {"।", "“", "”", "‘", "’"}
     _tokenizer = SinhalaTokenizer() if SinhalaTokenizer else None
@@ -145,6 +150,7 @@ class XAIService:
 
             if (
                 not term
+                or XAIService._is_number_token(term)
                 or term in XAIService.SINHALA_STOP_WORDS
                 or term in seen
             ):
@@ -185,6 +191,13 @@ class XAIService:
                 return token[: -len(suffix)]
 
         return token
+
+    @staticmethod
+    def _is_number_token(token: str) -> bool:
+        """Return true for standalone numeric tokens and formatted numbers."""
+        stripped = token.strip(".,:;!?()[]{}+-/%")
+        numeric = stripped.translate(str.maketrans("", "", ".,:/+-"))
+        return bool(numeric) and all(char.isdigit() for char in numeric)
     
     @staticmethod
     def _explain_safety(

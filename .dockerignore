@@ -30,6 +30,7 @@ share/python-wheels/
 # Virtual environments
 .venv
 venv
+venv_old
 env
 ENV
 env.bak
@@ -67,7 +68,6 @@ coverage.xml
 .pydevproject
 
 # Docker
-Dockerfile*
 .dockerignore
 docker-compose*.yml
 *.dockerignore
@@ -128,12 +128,18 @@ models/*.pth
 # Data files
 data/
 datasets/
+paper_figures_png/
+paper_figures_svg/
+_paper_unzipped/
+mobile/
+tools/
 *.csv
 *.json
 *.xml
 *.yaml
 !.pre-commit-config.yaml
 !.github/workflows/*.yaml
+!app/models/whisper-sinhala-accent-model/*.json
 
 # Frontend/static assets (if you have them)
 static/

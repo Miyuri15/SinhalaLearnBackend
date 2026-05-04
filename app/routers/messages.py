@@ -30,6 +30,7 @@ from app.services.session_resource_service import SessionResourceService
 from app.services.chat_session_service import ChatSessionService
 from app.services.resource_service import ResourceService
 from app.services.rag_service import RAGService
+from app.services.usage_service import UsageService
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.shared.models.user import User
@@ -67,6 +68,10 @@ def create_user_message(
             parsed_session_id = session.id
         else:
             parsed_session_id = UUID(session_id)
+
+        session_for_limit = chat_session_service.get_session(parsed_session_id)
+        if session_for_limit is None or session_for_limit.mode == "learning":
+            UsageService(db).check_learning_request_limit(current_user.id)
 
         message_service = MessageService(db)
 

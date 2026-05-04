@@ -88,11 +88,46 @@ Add to `.env`:
 
 ```
 DATABASE_URL=postgresql://test_user:your-password@localhost:5432/SinhalaDB
+ADMIN_BOOTSTRAP_TOKEN=change-this-one-time-admin-bootstrap-token
 ```
 
 **Note:** Update port to 5433 if using custom port option.
 
-## 6. Run the API
+## 6. Run Migrations
+
+```bash
+alembic upgrade head
+```
+
+The migration `e1f2a3b4c5d6_promote_admin_user.py` promotes `admin@sinhalalearn.com` to `role = 'admin'` if that user already exists. If the user does not exist yet, the migration still succeeds but updates zero rows.
+
+## 7. Create the First Admin
+
+Use the bootstrap endpoint once, after `ADMIN_BOOTSTRAP_TOKEN` is configured:
+
+```http
+POST /api/v1/auth/bootstrap-admin
+```
+
+Request body:
+
+```json
+{
+  "email": "admin@sinhalalearn.com",
+  "full_name": "Admin User",
+  "password": "your-admin-password",
+  "bootstrap_token": "change-this-one-time-admin-bootstrap-token"
+}
+```
+
+Behavior:
+
+- If no admin exists, this creates or promotes the user as `role = "admin"`.
+- If `admin@sinhalalearn.com` already exists, it promotes that user and updates the password from the request.
+- If any admin already exists, the endpoint returns `409` and cannot be used again.
+- Admins log in normally with `POST /api/v1/auth/signin`.
+
+## 8. Run the API
 
 ```bash
 uvicorn app.main:app --reload --port 8000

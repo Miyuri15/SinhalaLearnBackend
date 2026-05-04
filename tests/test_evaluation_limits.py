@@ -1,55 +1,61 @@
 # tests/test_evaluation_limits.py
-import sys
 import os
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
-# Add the project root to sys.path
+from sqlalchemy import Column, DateTime, ForeignKey, String, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
 
-from sqlalchemy import create_engine, text, String, JSON, Integer, DateTime, Column, ForeignKey
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-
-# We will define a minimal set of models for testing to avoid JSONB/UUID issues
 Base = declarative_base()
+
 
 class User(Base):
     __tablename__ = "users"
+
     id = Column(String, primary_key=True)
     email = Column(String)
-    tier = Column(String, default="normal")
+    tier = Column(String, default="basic")
+
 
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
+
     id = Column(String, primary_key=True)
     user_id = Column(String, ForeignKey("users.id"))
+    mode = Column(String, default="learning")
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(String, primary_key=True)
+    session_id = Column(String, ForeignKey("chat_sessions.id"))
+    role = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 class EvaluationSession(Base):
     __tablename__ = "evaluation_sessions"
+
     id = Column(String, primary_key=True)
     session_id = Column(String, ForeignKey("chat_sessions.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Mock Settings
-class MockSettings:
-    EVALUATION_LIMIT_NORMAL = 2
-    EVALUATION_LIMIT_BASIC = 20
-    EVALUATION_LIMIT_CLASSROOM = 60
-    EVALUATION_LIMIT_INSTITUTION = -1
-    EVALUATION_LIMIT_DURATION_HOURS = 12
 
-mock_settings = MockSettings()
-
-# Import the service logic but we might need to mock its dependencies
 from app.services.usage_service import UsageService
 
-# Patch UsageService to use our test models and settings
 import app.services.usage_service
+
 app.services.usage_service.User = User
 app.services.usage_service.ChatSession = ChatSession
+app.services.usage_service.Message = Message
 app.services.usage_service.EvaluationSession = EvaluationSession
-app.services.usage_service.settings = mock_settings
+
 
 def setup_db():
     engine = create_engine("sqlite:///:memory:")
@@ -57,81 +63,206 @@ def setup_db():
     Session = sessionmaker(bind=engine)
     return Session()
 
-def test_evaluation_limits():
+
+def test_tier_aliases_return_daily_evaluation_session_limits():
     db = setup_db()
     service = UsageService(db)
-    
-    # 1. Test Tier Mapping
-    print("Testing tier mapping...")
-    assert service.get_user_tier_limit("normal") == 2
-    assert service.get_user_tier_limit("basic") == 20
-    print("PASS")
 
-    # 2. Test Normal User Limit
-    print("Testing normal user limit...")
+    assert service.get_user_tier_limit("normal") == 1
+    assert service.get_user_tier_limit("basic") == 1
+    assert service.get_user_tier_limit("classroom") == 5
+    assert service.get_user_tier_limit("intermediate") == 5
+    assert service.get_user_tier_limit("institution") == 10
+    assert service.get_user_tier_limit("enterprise") == 10
+
+
+def test_user_tier_migration_maps_old_tiers():
+    migration_path = (
+        Path(BASE_DIR)
+        / "migrations"
+        / "versions"
+        / "c9d2f1e8a4b3_update_user_tier_defaults.py"
+    )
+    migration_text = migration_path.read_text(encoding="utf-8")
+
+    assert "normal' THEN 'basic" in migration_text
+    assert "classroom' THEN 'intermediate" in migration_text
+    assert "institution' THEN 'enterprise" in migration_text
+
+
+def test_basic_evaluation_session_limit_blocks_second_session_today():
+    db = setup_db()
+    service = UsageService(db)
     user_id = str(uuid4())
-    user = User(id=user_id, email="normal@test.com", tier="normal")
-    db.add(user)
-    
     chat_id = str(uuid4())
-    chat = ChatSession(id=chat_id, user_id=user_id)
-    db.add(chat)
-    db.commit()
 
-    # Add 2 evaluations (the limit)
-    for _ in range(2):
-        eval_id = str(uuid4())
-        evaluation = EvaluationSession(id=eval_id, session_id=chat_id, created_at=datetime.now())
-        db.add(evaluation)
-    db.commit()
-
-    # Next one should fail
-    try:
-        service.check_evaluation_limit(user_id)
-        print("FAIL: Should have raised HTTPException")
-        return
-    except Exception as e:
-        if hasattr(e, 'status_code') and e.status_code == 403:
-            print("PASS (received 403)")
-        else:
-            print(f"FAIL: Received unexpected exception: {e}")
-            return
-
-    # 3. Test Time Window
-    print("Testing time window...")
-    # Update old evaluations to be 13 hours ago
-    threshold = datetime.now() - timedelta(hours=13)
-    db.query(EvaluationSession).update({EvaluationSession.created_at: threshold})
-    db.commit()
-
-    # Now it should pass
-    try:
-        assert service.check_evaluation_limit(user_id) is True
-        print("PASS")
-    except Exception as e:
-        print(f"FAIL: Should have passed but got: {e}")
-        return
-
-    # 4. Test Institution Unlimited
-    print("Testing institution unlimited...")
-    user.tier = "institution"
-    db.commit()
-    
-    # Add 100 evaluations
-    for _ in range(100):
-        eval_id = str(uuid4())
-        evaluation = EvaluationSession(id=eval_id, session_id=chat_id, created_at=datetime.now())
-        db.add(evaluation)
+    db.add(User(id=user_id, email="basic@test.com", tier="basic"))
+    db.add(ChatSession(id=chat_id, user_id=user_id, mode="evaluation"))
+    db.add(EvaluationSession(id=str(uuid4()), session_id=chat_id, created_at=datetime.now()))
     db.commit()
 
     try:
-        assert service.check_evaluation_limit(user_id) is True
-        print("PASS")
-    except Exception as e:
-        print(f"FAIL: Institution should be unlimited but got: {e}")
-        return
+        service.check_evaluation_session_limit(user_id)
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 403
+    else:
+        raise AssertionError("Expected evaluation session limit to block the request")
 
-    print("\nALL EVALUATION LIMIT TESTS PASSED!")
 
-if __name__ == "__main__":
-    test_evaluation_limits()
+def test_basic_evaluation_session_limit_resets_next_day():
+    db = setup_db()
+    service = UsageService(db)
+    user_id = str(uuid4())
+    chat_id = str(uuid4())
+
+    db.add(User(id=user_id, email="basic@test.com", tier="basic"))
+    db.add(ChatSession(id=chat_id, user_id=user_id, mode="evaluation"))
+    db.add(
+        EvaluationSession(
+            id=str(uuid4()),
+            session_id=chat_id,
+            created_at=datetime.now() - timedelta(days=1),
+        )
+    )
+    db.commit()
+
+    assert service.check_evaluation_session_limit(user_id) is True
+
+
+def test_basic_learning_request_limit_blocks_sixth_request():
+    db = setup_db()
+    service = UsageService(db)
+    user_id = str(uuid4())
+    chat_id = str(uuid4())
+
+    db.add(User(id=user_id, email="basic@test.com", tier="basic"))
+    db.add(ChatSession(id=chat_id, user_id=user_id, mode="learning"))
+    for _ in range(5):
+        db.add(
+            Message(
+                id=str(uuid4()),
+                session_id=chat_id,
+                role="user",
+                created_at=datetime.now(),
+            )
+        )
+    db.commit()
+
+    try:
+        service.check_learning_request_limit(user_id)
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 403
+    else:
+        raise AssertionError("Expected learning request limit to block the request")
+
+
+def test_intermediate_learning_request_limit_blocks_twenty_first_request():
+    db = setup_db()
+    service = UsageService(db)
+    user_id = str(uuid4())
+    chat_id = str(uuid4())
+
+    db.add(User(id=user_id, email="intermediate@test.com", tier="intermediate"))
+    db.add(ChatSession(id=chat_id, user_id=user_id, mode="learning"))
+    for _ in range(20):
+        db.add(
+            Message(
+                id=str(uuid4()),
+                session_id=chat_id,
+                role="user",
+                created_at=datetime.now(),
+            )
+        )
+    db.commit()
+
+    try:
+        service.check_learning_request_limit(user_id)
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 403
+    else:
+        raise AssertionError("Expected intermediate learning limit to block the request")
+
+
+def test_enterprise_learning_request_limit_blocks_fifty_first_request():
+    db = setup_db()
+    service = UsageService(db)
+    user_id = str(uuid4())
+    chat_id = str(uuid4())
+
+    db.add(User(id=user_id, email="enterprise@test.com", tier="enterprise"))
+    db.add(ChatSession(id=chat_id, user_id=user_id, mode="learning"))
+    for _ in range(50):
+        db.add(
+            Message(
+                id=str(uuid4()),
+                session_id=chat_id,
+                role="user",
+                created_at=datetime.now(),
+            )
+        )
+    db.commit()
+
+    try:
+        service.check_learning_request_limit(user_id)
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 403
+    else:
+        raise AssertionError("Expected enterprise learning limit to block the request")
+
+
+def test_intermediate_evaluation_session_limit_blocks_sixth_session_today():
+    db = setup_db()
+    service = UsageService(db)
+    user_id = str(uuid4())
+    chat_id = str(uuid4())
+
+    db.add(User(id=user_id, email="intermediate@test.com", tier="intermediate"))
+    db.add(ChatSession(id=chat_id, user_id=user_id, mode="evaluation"))
+    for _ in range(5):
+        db.add(EvaluationSession(id=str(uuid4()), session_id=chat_id, created_at=datetime.now()))
+    db.commit()
+
+    try:
+        service.check_evaluation_session_limit(user_id)
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 403
+    else:
+        raise AssertionError("Expected intermediate evaluation limit to block the request")
+
+
+def test_enterprise_evaluation_session_limit_blocks_eleventh_session_today():
+    db = setup_db()
+    service = UsageService(db)
+    user_id = str(uuid4())
+    chat_id = str(uuid4())
+
+    db.add(User(id=user_id, email="enterprise@test.com", tier="enterprise"))
+    db.add(ChatSession(id=chat_id, user_id=user_id, mode="evaluation"))
+    for _ in range(10):
+        db.add(EvaluationSession(id=str(uuid4()), session_id=chat_id, created_at=datetime.now()))
+    db.commit()
+
+    try:
+        service.check_evaluation_session_limit(user_id)
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 403
+    else:
+        raise AssertionError("Expected enterprise evaluation limit to block the request")
+
+
+def test_basic_evaluations_per_session_limit_blocks_over_ten():
+    db = setup_db()
+    service = UsageService(db)
+    user_id = str(uuid4())
+
+    db.add(User(id=user_id, email="basic@test.com", tier="basic"))
+    db.commit()
+
+    answer_resource_ids = [uuid4() for _ in range(11)]
+
+    try:
+        service.check_evaluations_per_session_limit(user_id, answer_resource_ids)
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 403
+    else:
+        raise AssertionError("Expected per-session evaluation limit to block the request")

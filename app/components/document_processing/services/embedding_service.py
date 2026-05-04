@@ -11,7 +11,13 @@ def generate_text_embedding(text: str) -> List[float]:
     cleaned = basic_clean(text)
     if not cleaned:
         return []
-    return generate_embedding(cleaned)
+    return generate_embedding(
+        cleaned,
+        service_name="text_embedding",
+        metadata_json={
+            "source": "generate_text_embedding",
+        },
+    )
 
 
 def embed_document_text(
@@ -25,7 +31,13 @@ def embed_document_text(
         return []
     if progress_callback:
         progress_callback("Generating Document Embedding", 55.0, {"status": "in_progress"})
-    embedding = generate_embedding(cleaned)
+    embedding = generate_embedding(
+        cleaned,
+        service_name="document_embedding",
+        metadata_json={
+            "source": "embed_document_text",
+        },
+    )
     if progress_callback:
         progress_callback("Document Embedding Complete", 60.0, {"dimensions": len(embedding)})
     return embedding
@@ -71,7 +83,17 @@ def embed_chunks(
                 },
             )
 
-        vec = generate_embedding(c_text)
+        vec = generate_embedding(
+            c_text,
+            resource_id=doc_id,
+            service_name="chunk_embedding",
+            metadata_json={
+                "source": "embed_chunks",
+                "doc_id": str(doc_id) if doc_id else None,
+                "chunk_id": c_id,
+                "global_id": f"{doc_id}_{c_id}" if doc_id else str(c_id),
+            },
+        )
 
         global_id = f"{doc_id}_{c_id}" if doc_id else str(c_id)
 

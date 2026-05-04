@@ -13,7 +13,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import torch
 from rank_bm25 import BM25Okapi
-from sentence_transformers import util
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from sqlalchemy.orm.exc import StaleDataError
@@ -29,13 +28,19 @@ from app.shared.models.session_resources import SessionResource
 from app.shared.models.evaluation_session import EvaluationSession, PaperConfig
 from app.shared.models.resource_file import ResourceFile
 from app.shared.models.rubrics import Rubric, RubricCriterion
-from app.shared.ai.embeddings import xlmr, ml_semaphore, ensure_sentences_cached, _embedding_cache
+from app.shared.ai.embeddings import get_xlmr_model, ml_semaphore, ensure_sentences_cached, _embedding_cache
 from app.shared.ai.gemini_client import gemini_generate_evaluation
 from app.core.config import settings
 from app.core.gemini_client import GeminiClient
 from app.services.evaluation.gemini_cost_policy import EvaluationGeminiClient
 
 logger = logging.getLogger(__name__)
+
+
+def _cosine_util():
+    from sentence_transformers import util
+
+    return util
 
 
 class GradingService:
@@ -338,6 +343,16 @@ class GradingService:
 
         logger.info(f"Scoring loop finished. Scored {len(scored_items)} items total.")
 
+        # Pre-compute the exact marks that will be persisted so feedback can be
+        # written against the same score the user sees in the UI.
+        for item in scored_items:
+            system_ratio = float(item["awarded_marks"]) / max(1, item["max_marks"])
+            final_snapped_ratio = self._apply_discrete_bands(system_ratio, item["max_marks"])
+            final_marks = Decimal(str(final_snapped_ratio * item["max_marks"])).quantize(Decimal("0.5"))
+            item["system_ratio"] = system_ratio
+            item["final_snapped_ratio"] = final_snapped_ratio
+            item["final_marks"] = final_marks
+
         # -------------------------------------------------------
         # PHASE 2: Gemini feedback ONLY — no marks from Gemini ever
         # Only runs for Paper II (max_marks > 2) to save time.
@@ -448,12 +463,25 @@ class GradingService:
                 # _apply_discrete_bands snaps to clean mark steps.
                 # Gemini output is NOT read here for marks under any circumstance.
                 # -------------------------------------------------------
-                system_ratio = float(item["awarded_marks"]) / max(1, item["max_marks"])
-                final_snapped_ratio = self._apply_discrete_bands(system_ratio, item["max_marks"])
-                final_marks = Decimal(str(final_snapped_ratio * item["max_marks"])).quantize(Decimal("0.5"))
+                system_ratio = item.get("system_ratio") or float(item["awarded_marks"]) / max(1, item["max_marks"])
+                final_snapped_ratio = item.get("final_snapped_ratio")
+                if final_snapped_ratio is None:
+                    final_snapped_ratio = self._apply_discrete_bands(system_ratio, item["max_marks"])
+                final_marks = item.get("final_marks")
+                if final_marks is None:
+                    final_marks = Decimal(str(final_snapped_ratio * item["max_marks"])).quantize(Decimal("0.5"))
                 # Feedback text from Gemini (text only, never marks)
                 meaning_data = eval_data_map.get(item["key"], {})
                 feedback = meaning_data.get("feedback", "පිළිතුර අගය කරන ලදී.")
+                if not feedback or self._feedback_contradicts_score(feedback, item):
+                    logger.warning(
+                        "Replacing missing or score-contradictory feedback for Q%s. final_marks=%s/%s feedback=%s",
+                        item["display_number"],
+                        final_marks,
+                        item["max_marks"],
+                        str(feedback)[:120],
+                    )
+                    feedback = self._build_score_aligned_feedback(item)
                 logger.info(
                     f"[FINAL_MARK] Q{item['display_number']} | "
                     f"system_ratio={system_ratio:.4f} -> snapped_ratio={final_snapped_ratio:.4f} -> "
@@ -675,23 +703,21 @@ class GradingService:
 
         logger.info(f"Generating on-demand batch & overall feedback for result {result.id}")
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            # Only send essays to Gemini
-            essay_items = [i for i in scored_items if i["max_marks"] > 2]
-            future_batch = executor.submit(self._get_batch_feedback_from_gemini, essay_items)
-            future_overall = executor.submit(self._generate_overall_feedback, result.total_score, result.id)
+        # Only send essays to Gemini. Keep feedback calls sequential because the
+        # paid API can still return transient 503s when several Flash requests
+        # are fired at once.
+        essay_items = [i for i in scored_items if i["max_marks"] > 2]
+        try:
+            eval_data_map = self._get_batch_feedback_from_gemini(essay_items)
+        except Exception as e:
+            logger.error(f"Batch feedback generation failed: {e}")
+            eval_data_map = {}
 
-            try:
-                eval_data_map = future_batch.result()
-            except Exception as e:
-                logger.error(f"Batch feedback generation failed: {e}")
-                eval_data_map = {}
-
-            try:
-                overall_feedback = future_overall.result()
-            except Exception as e:
-                logger.error(f"Overall feedback generation failed: {e}")
-                overall_feedback = f"Total Score: {result.total_score}"
+        try:
+            overall_feedback = self._generate_overall_feedback(result.total_score, result.id)
+        except Exception as e:
+            logger.error(f"Overall feedback generation failed: {e}")
+            overall_feedback = f"Total Score: {result.total_score}"
 
         # Generate short-answer feedback locally - improved templates
         for item in scored_items:
@@ -856,25 +882,25 @@ class GradingService:
         if not sentences:
             with ml_semaphore:
                 emb1 = student_emb if student_emb is not None else _embedding_cache.get(student_text)
-                if emb1 is None: emb1 = xlmr.encode(student_text, convert_to_tensor=True)
+                if emb1 is None: emb1 = get_xlmr_model().encode(student_text, convert_to_tensor=True)
 
                 emb2 = reference_emb if reference_emb is not None else _embedding_cache.get(reference_text)
-                if emb2 is None: emb2 = xlmr.encode(reference_text, convert_to_tensor=True)
+                if emb2 is None: emb2 = get_xlmr_model().encode(reference_text, convert_to_tensor=True)
 
-            raw_sim = util.cos_sim(emb1, emb2).item()
+            raw_sim = _cosine_util().cos_sim(emb1, emb2).item()
             return self._sinhala_sigmoid_boost(raw_sim, max_marks)
 
         s_emb = student_emb if student_emb is not None else _embedding_cache.get(student_text)
         if s_emb is None:
             with ml_semaphore:
-                s_emb = xlmr.encode(student_text, convert_to_tensor=True)
+                s_emb = get_xlmr_model().encode(student_text, convert_to_tensor=True)
 
         missing = [s for s in sentences if s not in _embedding_cache]
         if missing:
             ensure_sentences_cached(missing)
 
         ref_embs = torch.stack([_embedding_cache[s] for s in sentences])
-        sims = util.cos_sim(s_emb, ref_embs)[0]
+        sims = _cosine_util().cos_sim(s_emb, ref_embs)[0]
 
         # Blend max-match (70%) with top-3 average (30%) for stability
         k = min(3, len(sims))
@@ -933,6 +959,8 @@ class GradingService:
         snapped_marks = (Decimal(str(actual_marks)) / step).quantize(
             Decimal("1"), rounding=ROUND_HALF_UP
         ) * step
+        if max_marks > 2 and ratio < high_threshold:
+            snapped_marks = min(snapped_marks, Decimal(str(max_marks)) - step)
 
         final_ratio = float(snapped_marks / Decimal(str(max_marks)))
         return min(1.0, final_ratio)
@@ -1504,9 +1532,14 @@ Questions:
         max_requests = max(1, int(settings.EVAL_GEMINI_REFERENCE_SCHEMA_MAX_REQUESTS))
         chunks: List[List[Dict]] = [[]]
         current_chars = 0
-        max_chunk_chars = 4500
+        max_chunk_chars = 2500
         for question in questions:
-            estimated_chars = len(question.get("question_text", "")) + 200
+            evidence_preview = self._build_reference_context_block(question, syllabus_text)
+            estimated_chars = (
+                len(question.get("question_text", ""))
+                + len(evidence_preview or "")
+                + 300
+            )
             if (
                 chunks[-1]
                 and current_chars + estimated_chars > max_chunk_chars
@@ -1625,11 +1658,10 @@ Return ONLY a valid JSON object mirroring the keys provided.
         """
         Measures how many key concepts from the reference the student covered.
 
-        FIX: The denominator is now capped to max_marks * 2 instead of
-        len(sentences) * 0.70. This means:
-        - A 4-mark question expects ~8 key concept sentences.
-        - A student who covers 4 of them gets 4/8 = 0.50 coverage (not 4/14 = 0.28).
-        - This correctly reflects partial credit for partial answers.
+        The denominator is capped to a mark-aware expected concept count instead
+        of the full raw reference sentence count. This means a 4-mark question
+        expects roughly 4 distinct covered points, while long BM25 contexts do
+        not unfairly dilute otherwise relevant answers.
 
         Previously, BM25 could return 20 long syllabus sentences as context, and a
         student covering all the required points still got coverage ~0.21 because
@@ -1647,24 +1679,25 @@ Return ONLY a valid JSON object mirroring the keys provided.
         s_emb = student_emb if student_emb is not None else _embedding_cache.get(student_text)
         if s_emb is None:
             with ml_semaphore:
-                s_emb = xlmr.encode(student_text, convert_to_tensor=True)
+                s_emb = get_xlmr_model().encode(student_text, convert_to_tensor=True)
 
         missing_sentences = [s for s in sentences if s not in _embedding_cache]
         if missing_sentences:
             ensure_sentences_cached(missing_sentences)
 
         sentence_embs = torch.stack([_embedding_cache[s] for s in sentences])
-        sims = util.cos_sim(s_emb, sentence_embs)[0]
+        sims = _cosine_util().cos_sim(s_emb, sentence_embs)[0]
 
         # Threshold: how similar must a sentence be to count as "covered"
         # Relaxed from 0.32 to 0.28 to reward pooled concise bullet items without dilution.
         threshold = 0.28 if max_marks <= 2 else 0.28
         hits = int((sims >= threshold).sum().item())
 
-        # KEY FIX: Cap denominator to expected concept count for this question.
-        # Ensure deep essays (e.g. 18 marks) don't unreasonably penalize excellent answers
-        # by expecting 36 discrete points to score a 1.0 coverage. Cap to max_marks * 0.6.
-        expected_concepts = min(len(sentences), max_marks * 0.60)
+        # Cap the denominator to a fair expected concept count for this question.
+        # A 4-mark structured essay should normally need about 4 distinct points
+        # for full coverage. The previous max_marks * 0.60 cap let 2-3 loose
+        # matches count as perfect coverage and inflated Paper II scores.
+        expected_concepts = min(len(sentences), max(1, max_marks))
         ratio = hits / max(1, expected_concepts)
 
         return min(1.0, ratio), f"{hits}/{len(sentences)} concepts covered"
@@ -1944,6 +1977,82 @@ Return ONLY a valid JSON object mirroring the keys provided.
                 return str(question.label)
         return q_number
 
+    def _score_band_label(self, item: Dict[str, Any]) -> str:
+        final_marks = Decimal(str(item.get("final_marks", item.get("awarded_marks", 0))))
+        max_marks = Decimal(str(max(1, item.get("max_marks", 1))))
+        ratio = float(final_marks / max_marks)
+        if ratio >= 0.875:
+            return "excellent"
+        if ratio >= 0.625:
+            return "good"
+        if ratio >= 0.375:
+            return "partial"
+        if ratio > 0:
+            return "limited"
+        return "not_creditworthy"
+
+    def _build_score_aligned_feedback(self, item: Dict[str, Any]) -> str:
+        display = item.get("display_number", "")
+        final_marks = item.get("final_marks", item.get("awarded_marks", 0))
+        max_marks = item.get("max_marks", 1)
+        band = self._score_band_label(item)
+
+        if band == "excellent":
+            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුර ඉතා හොඳ මට්ටමේ ඇත. ප්‍රධාන කරුණු බොහෝ දුරට නිවැරදිව ආවරණය කර ඇත."
+        elif band == "good":
+            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුර බොහෝ දුරට නිවැරදිය. තවත් නිශ්චිත කරුණු කිහිපයක් එකතු කළහොත් පිළිතුර වඩා සම්පූර්ණ වේ."
+        elif band == "partial":
+            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුර අර්ධ වශයෙන් නිවැරදිය. ප්‍රශ්නයට අදාළ ප්‍රධාන කරුණු තවදුරටත් පැහැදිලි කළ යුතුය."
+        elif band == "limited":
+            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුර සීමිත මට්ටමේ ඇත. අදාළ කරුණු පැහැදිලිව සහ ප්‍රමාණවත් ලෙස දැක්වීම අවශ්‍ය වේ."
+        else:
+            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුරට ලකුණු ලබා දීමට ප්‍රමාණවත් අදාළ කරුණු හමු නොවේ."
+
+        return f"**ප්‍රශ්නය {display}** {body} ({final_marks}/{max_marks})"
+
+    def _feedback_contradicts_score(self, feedback: str, item: Dict[str, Any]) -> bool:
+        if not feedback:
+            return True
+
+        text = str(feedback).lower()
+        unavailable_markers = [
+            "gemini",
+            "ප්‍රතිපෝෂණ ලබා ගත නොහැක",
+            "ලබා ගත නොහැක",
+        ]
+        if any(marker in text for marker in unavailable_markers):
+            return True
+
+        final_marks = Decimal(str(item.get("final_marks", item.get("awarded_marks", 0))))
+        max_marks = Decimal(str(max(1, item.get("max_marks", 1))))
+        ratio = float(final_marks / max_marks)
+
+        says_fully_correct = any(
+            marker in text
+            for marker in [
+                "සම්පූර්ණයෙන්ම නිවැරදි",
+                "සම්පූර්ණ නිවැරදි",
+                "fully correct",
+                "completely correct",
+            ]
+        )
+        says_wrong = any(
+            marker in text
+            for marker in [
+                "සම්පූර්ණයෙන්ම වැරදි",
+                "සම්පූර්ණයෙන්ම වැරදියි",
+                "නිවැරදි නොවේ",
+                "completely wrong",
+                "fully wrong",
+            ]
+        )
+
+        if ratio <= 0.25 and says_fully_correct:
+            return True
+        if ratio >= 0.75 and says_wrong:
+            return True
+        return False
+
 
     # ----------------------------------------------------------
     # GEMINI FEEDBACK — TEXT ONLY, NEVER MARKS
@@ -1972,6 +2081,8 @@ FEEDBACK REQUIREMENTS:
 3. Keep feedback concise (2-3 sentences).
 4. Use Markdown formatting: **bold** for emphasis, bullet points if needed.
 5. Language: Simple, professional written Sinhala.
+6. The final awarded mark is already fixed. Your feedback MUST match that mark.
+7. If the final mark is 0, do not say the answer is correct. If the final mark is high, do not say the answer is completely wrong.
 
 OUTPUT FORMAT (Pure JSON only):
 {
@@ -1992,6 +2103,8 @@ Questions to evaluate:
                 chunk_prompt += f"Question Number: {item['display_number']}\n"
                 chunk_prompt += f"Question: {q_text}\n"
                 chunk_prompt += f"Max Marks: {item['max_marks']}\n"
+                chunk_prompt += f"Final Awarded Marks: {item.get('final_marks', item['awarded_marks'])}/{item['max_marks']}\n"
+                chunk_prompt += f"Score Band: {self._score_band_label(item)}\n"
                 chunk_prompt += f"Student Answer: {str(item['student_text'])[:500]}\n"
                 chunk_prompt += f"Reference Context: {str(item['reference_text'])[:600]}\n"
 
@@ -1999,7 +2112,12 @@ Questions to evaluate:
                 sent_keys = [it["key"] for it in chunk]
                 logger.info(f"Sending Gemini feedback batch for keys: {sent_keys}")
 
-                res_data = self.gemini.generate_content(chunk_prompt, json_mode=True)
+                res_data = self.gemini.generate_content(
+                    chunk_prompt,
+                    json_mode=True,
+                    max_retries=2,
+                    model_name=settings.EVAL_GEMINI_QUESTION_PARSING_MODEL,
+                )
                 response_json = res_data.get("text") or "{}"
                 try:
                     clean_json = re.sub(r'^```json\s*|\s*```$', '', response_json.strip(), flags=re.MULTILINE)
@@ -2034,21 +2152,19 @@ Questions to evaluate:
                 logger.error(f"Gemini feedback batch failed: {e}")
                 return {}
 
-        # Batch size 8: Gemini context window handles this easily, reduces API call count
-        batch_size = 8
+        # Smaller chunks recover better when one model is overloaded or denied.
+        batch_size = 4
         chunks = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
 
         evaluation_data = {}
-        # max_workers 6: more parallelism to reduce total wall-clock time
-        with ThreadPoolExecutor(max_workers=min(len(chunks), 6)) as executor:
-            future_to_chunk = {executor.submit(process_chunk, chunk): chunk for chunk in chunks}
-            for future in as_completed(future_to_chunk):
-                try:
-                    result = future.result()
-                    if result:
-                        evaluation_data.update(result)
-                except Exception as exc:
-                    logger.error(f"Gemini feedback chunk failed: {exc}")
+        for chunk in chunks:
+            try:
+                result = process_chunk(chunk)
+                if result:
+                    evaluation_data.update(result)
+            except Exception as exc:
+                logger.error(f"Gemini feedback chunk failed: {exc}")
+            time.sleep(0.5)
 
         # Build final map — ONLY extract feedback text, never any numeric value
         final_map = {}
@@ -2062,6 +2178,21 @@ Questions to evaluate:
                 # NOTE: No "marks", "score", or numeric value is ever stored here.
                 # awarded_marks is set exclusively by _apply_discrete_bands().
             }
+            if not raw_feedback or raw_feedback.startswith("("):
+                raw_feedback = "ප්‍රතිපෝෂණ ලබා ගත නොහැක. Gemini සේවාව තාවකාලිකව අසාර්ථක විය."
+            final_map[key]["feedback"] = f"**ප්‍රශ්නය {item['display_number']}** {raw_feedback}"
+
+        for item in items:
+            key = item["key"]
+            feedback = (final_map.get(key) or {}).get("feedback")
+            if not feedback or self._feedback_contradicts_score(feedback, item):
+                logger.warning(
+                    "Replacing missing or score-contradictory Gemini feedback for Q%s. final_marks=%s/%s",
+                    item["display_number"],
+                    item.get("final_marks", item["awarded_marks"]),
+                    item["max_marks"],
+                )
+                final_map[key] = {"feedback": self._build_score_aligned_feedback(item)}
 
         return final_map
 
@@ -2075,6 +2206,14 @@ Evaluate the performance based on this score and generate a quality overall feed
 High quality feedback highlights strengths and provides specific advice for improvement.
 Use Markdown for presentation. Use simple and direct language.
 """
-            return self.gemini.generate_content(prompt).text or ""
-        except Exception:
+            res_data = self.gemini.generate_content(
+                prompt,
+                max_retries=2,
+                model_name=settings.EVAL_GEMINI_QUESTION_PARSING_MODEL,
+            )
+            if isinstance(res_data, dict):
+                return res_data.get("text") or f"Total Score: {total_score}"
+            return f"Total Score: {total_score}"
+        except Exception as e:
+            logger.error(f"Overall feedback generation failed: {e}")
             return f"Total Score: {total_score}"

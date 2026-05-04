@@ -14,9 +14,19 @@ from app.routers import (
 from app.core.whisper_loader import WhisperLoader
 from app.components.document_processing.services.classify_text_type_ml import TextTypeClassifierLoader
 from app.api.v1.router import api_router
+from app.core.config import settings
 from app.core.database import Base, engine
 
 logger = logging.getLogger(__name__)
+
+cors_origins = [
+    "http://localhost:64792",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+if settings.FRONTEND_URL and settings.FRONTEND_URL not in cors_origins:
+    cors_origins.append(settings.FRONTEND_URL)
 
 app = FastAPI(
     title="Sinhala Educational Assistant API",
@@ -26,11 +36,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:64792",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,12 +58,15 @@ def on_startup():
             str(e)
         )
 
-    try:
-        logger.info("Loading Whisper model at startup...")
-        WhisperLoader.load()
-        logger.info("Whisper model loaded successfully.")
-    except Exception as e:
-        logger.error("Whisper model failed to load: %s", str(e))
+    if settings.LOAD_WHISPER_ON_STARTUP:
+        try:
+            logger.info("Loading Whisper model at startup...")
+            WhisperLoader.load()
+            logger.info("Whisper model loaded successfully.")
+        except Exception as e:
+            logger.error("Whisper model failed to load: %s", str(e))
+    else:
+        logger.info("Skipping Whisper startup load; model will load on first use.")
 
     try:
         logger.info("Loading MobileNet text type classifier at startup...")

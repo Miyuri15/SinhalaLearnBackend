@@ -38,13 +38,7 @@ class MessageRepository:
         )
         logger.debug("Persisting new user message to DB (session=%s)", session_id)
         self.db.add(msg)
-        try:
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            logger.exception("Failed to commit new message for session %s", session_id)
-            raise
-        self.db.refresh(msg)
+        self.db.flush()
         logger.debug("Message persisted with id=%s", getattr(msg, "id", None))
         return msg
 

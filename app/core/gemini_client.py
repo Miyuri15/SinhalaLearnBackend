@@ -3,6 +3,7 @@ import logging
 import time
 import random
 import threading
+from uuid import UUID
 from google import genai
 from app.core.config import settings
 
@@ -36,15 +37,16 @@ else:
 MODEL_NAME = "gemini-2.5-flash"
 MODEL_FALLBACKS = [
     MODEL_NAME,
+    "gemini-2.0-flash",
     "gemini-2.5-pro",
-    "gemini-1.5-flash",
+    "gemini-2.5-flash-lite",
 ]
 _active_model_index = 0
 _model_index_lock = threading.Lock()
 
 # Increased from 5 → 10 to support parallel per-question Gemini feedback calls
 # SAFER: Set to 5 to support faster parallel feedback generation while remaining within typical API limits
-_ai_semaphore = threading.Semaphore(5)
+_ai_semaphore = threading.Semaphore(2)
 
 class GeminiClient:
     @classmethod
@@ -79,6 +81,19 @@ class GeminiClient:
         return override_model or MODEL_FALLBACKS[_active_model_index]
 
     @classmethod
+    def _get_model_candidates(cls, override_model: str | None = None) -> list[str]:
+        candidates = []
+        if override_model:
+            candidates.append(override_model)
+        else:
+            candidates.append(cls._get_model_name())
+
+        for fallback in MODEL_FALLBACKS:
+            if fallback not in candidates:
+                candidates.append(fallback)
+        return candidates
+
+    @classmethod
     def _switch_to_next_model(cls) -> bool:
         global _active_model_index
         if len(MODEL_FALLBACKS) < 2:
@@ -107,11 +122,22 @@ class GeminiClient:
         if is_overloaded:
             return "overloaded"
 
+        is_model_access_error = (
+            "403" in error_msg
+            and (
+                "project has been denied access" in error_msg
+                or "denied access" in error_msg
+                or "permission_denied" in error_msg
+                or "permission denied" in error_msg
+            )
+        )
+        if is_model_access_error:
+            return "model_access_denied"
+
         is_auth_error = (
             "unauthenticated" in error_msg
             or "invalid api key" in error_msg
             or "api key not valid" in error_msg
-            or "permission denied" in error_msg
         )
         if is_auth_error:
             return "auth_failed"
@@ -131,7 +157,7 @@ class GeminiClient:
 
     @staticmethod
     def _get_wait_time(reason: str, attempt: int) -> float:
-        if reason == "model_not_found":
+        if reason in {"model_not_found", "model_access_denied"}:
             return 0
         base_wait = 3 if reason == "rate_limited" else 2
         return min(30, (base_wait * (attempt + 1)) + random.uniform(1, 5))
@@ -144,28 +170,47 @@ class GeminiClient:
         safety_settings: list = None,
         json_mode: bool = False,
         model_name: str | None = None,
+        user_id: UUID | None = None,
+        session_id: UUID | None = None,
+        message_id: UUID | None = None,
+        service_name: str = "message_generation",
     ) -> dict:
         """
         Generate content from Gemini and return text + token usage.
-        Includes rate limiting (semaphore) and retry logic (exponential backoff).
-        Token counts are obtained from actual API response (usage_metadata).
+        Includes rate limiting, retry logic, model fallback, API key rotation,
+        and API usage logging.
         """
         from google.genai import types
+        from app.services.api_usage_log_service import ApiUsageLogService
+
+        request_start_time = time.time()
+        logical_request_id = f"gemini-{int(request_start_time * 1000)}-{random.randint(1000, 9999)}"
+
         config = types.GenerateContentConfig(
             safety_settings=safety_settings,
             response_mime_type="application/json" if json_mode else "text/plain",
-            max_output_tokens=8192
+            max_output_tokens=8192,
         )
 
-        for attempt in range(max_retries + 1):
-            try:
-                client = cls.get_client()
-                with _ai_semaphore:
-                    response = client.models.generate_content(
-                        model=cls._get_model_name(model_name),
-                        contents=prompt,
-                        config=config
-                    )
+        model_candidates = cls._get_model_candidates(model_name)
+        last_error = None
+
+        for model_index, candidate_model in enumerate(model_candidates):
+            attempts_for_model = min(max_retries, 1) if len(model_candidates) > 1 else max_retries
+
+            for attempt in range(attempts_for_model + 1):
+                attempt_start_time = time.time()
+                current_key_slot = _active_client_index
+
+                try:
+                    client = cls.get_client()
+
+                    with _ai_semaphore:
+                        response = client.models.generate_content(
+                            model=candidate_model,
+                            contents=prompt,
+                            config=config,
+                        )
 
                     text = response.text or ""
 
@@ -175,37 +220,131 @@ class GeminiClient:
                     completion_tokens = usage.candidates_token_count if usage else 0
                     total_tokens = usage.total_token_count if usage else 0
 
+                    duration_ms = round((time.time() - attempt_start_time) * 1000, 2)
+
+                    ApiUsageLogService.create_log(
+                        request_id=logical_request_id,
+                        provider="gemini",
+                        service_name=service_name,
+                        model_name=candidate_model,
+                        user_id=user_id,
+                        session_id=session_id,
+                        message_id=message_id,
+                        prompt_chars=len(prompt or ""),
+                        response_chars=len(text or ""),
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        attempt_number=attempt + 1,
+                        max_retries=max_retries,
+                        is_retry=attempt > 0,
+                        status="success",
+                        duration_ms=duration_ms,
+                        metadata_json={
+                            "json_mode": json_mode,
+                            "key_slot": current_key_slot,
+                            "model_index": model_index,
+                        },
+                    )
+
                     return {
                         "text": text,
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens
+                        "total_tokens": total_tokens,
                     }
 
-            except Exception as e:
-                error_msg = str(e).lower()
-                retry_reason = cls._classify_retry(error_msg)
+                except Exception as e:
+                    last_error = e
+                    duration_ms = round((time.time() - attempt_start_time) * 1000, 2)
+                    error_msg = str(e).lower()
+                    retry_reason = cls._classify_retry(error_msg)
 
-                if retry_reason and attempt < max_retries:
-                    if retry_reason == "model_not_found" and not model_name:
-                        cls._switch_to_next_model()
-                    else:
+                    should_retry_same_model = bool(retry_reason and attempt < attempts_for_model)
+                    should_try_next_model = (
+                        retry_reason in {
+                            "rate_limited",
+                            "overloaded",
+                            "model_access_denied",
+                            "model_not_found",
+                        }
+                        and model_index < len(model_candidates) - 1
+                    )
+
+                    ApiUsageLogService.create_log(
+                        request_id=logical_request_id,
+                        provider="gemini",
+                        service_name=service_name,
+                        model_name=candidate_model,
+                        user_id=user_id,
+                        session_id=session_id,
+                        message_id=message_id,
+                        prompt_chars=len(prompt or ""),
+                        response_chars=0,
+                        attempt_number=attempt + 1,
+                        max_retries=max_retries,
+                        is_retry=attempt > 0,
+                        status="retry" if should_retry_same_model or should_try_next_model else "failed",
+                        error_type=retry_reason or "unknown_error",
+                        error_message=str(e)[:1000],
+                        duration_ms=duration_ms,
+                        metadata_json={
+                            "json_mode": json_mode,
+                            "key_slot": current_key_slot,
+                            "model_index": model_index,
+                        },
+                    )
+
+                    if retry_reason in {"model_not_found", "model_access_denied"}:
+                        logger.warning(
+                            "Gemini model %s unavailable/access denied. Trying fallback model if available. Error: %s",
+                            candidate_model,
+                            e,
+                        )
+                        break
+
+                    if should_retry_same_model:
                         # If multiple keys are configured, rotate keys before backing off.
                         cls._switch_to_next_client()
 
-                    # Exponential backoff: base_wait * (attempt+1) + jitter
-                    # capped to avoid huge wait times that frustrate users
-                    wait_time = cls._get_wait_time(retry_reason, attempt)
-                    
-                    logger.warning(
-                        f"Gemini API {retry_reason} (Attempt {attempt+1}/{max_retries+1}). "
-                        f"Retrying in {wait_time:.2f}s (Capped at 30s)... Error: {e}"
+                        wait_time = cls._get_wait_time(retry_reason, attempt)
+
+                        logger.warning(
+                            "Gemini API %s on model %s (Attempt %s/%s). "
+                            "Retrying in %.2fs (Capped at 30s)... Error: %s",
+                            retry_reason,
+                            candidate_model,
+                            attempt + 1,
+                            attempts_for_model + 1,
+                            wait_time,
+                            e,
+                        )
+
+                        if wait_time > 0:
+                            time.sleep(wait_time)
+
+                        continue
+
+                    if should_try_next_model:
+                        next_model = model_candidates[model_index + 1]
+                        logger.warning(
+                            "Gemini model %s stayed %s after %s attempt(s). Failing over to %s.",
+                            candidate_model,
+                            retry_reason,
+                            attempt + 1,
+                            next_model,
+                        )
+                        break
+
+                    logger.error(
+                        "Gemini API final failure on model %s after %s attempts: %s",
+                        candidate_model,
+                        attempt + 1,
+                        e,
                     )
-                    if wait_time > 0:
-                        time.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"Gemini API final failure after {attempt+1} attempts: {e}")
                     raise e
+
+        if last_error:
+            raise last_error
 
         return {"text": "", "error": "Maximum retries exceeded"}

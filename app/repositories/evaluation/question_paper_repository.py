@@ -52,9 +52,28 @@ class QuestionPaperRepository:
         chat_session_id: UUID
     ) -> None:
         """Delete all question papers for a chat session."""
+        papers = self.get_question_papers_by_chat_session(chat_session_id)
+        paper_ids = [paper.id for paper in papers]
+        if not paper_ids:
+            return
+
+        question_ids = [
+            question_id
+            for (question_id,) in self.db.query(Question.id)
+            .filter(Question.question_paper_id.in_(paper_ids))
+            .all()
+        ]
+        if question_ids:
+            self.db.query(SubQuestion).filter(
+                SubQuestion.question_id.in_(question_ids)
+            ).delete(synchronize_session=False)
+            self.db.query(Question).filter(
+                Question.id.in_(question_ids)
+            ).delete(synchronize_session=False)
+
         self.db.query(QuestionPaper).filter(
             QuestionPaper.chat_session_id == chat_session_id
-        ).delete()
+        ).delete(synchronize_session=False)
         self.db.commit()
 
     def get_question_papers_by_evaluation_session(

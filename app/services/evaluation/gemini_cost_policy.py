@@ -45,6 +45,8 @@ class EvaluationGeminiClient:
         if not prompt or not prompt.strip():
             return ""
 
+        request_budget = max(1, int(budget.request_budget or 1))
+        max_retries = request_budget - 1
         requests_used = 1
         fallback_used = False
         log_reason = reason or "primary"
@@ -62,7 +64,7 @@ class EvaluationGeminiClient:
         try:
             result = GeminiClient.generate_content(
                 prompt,
-                max_retries=0,
+                max_retries=max_retries,
                 json_mode=json_mode,
                 model_name=budget.model_name,
             )

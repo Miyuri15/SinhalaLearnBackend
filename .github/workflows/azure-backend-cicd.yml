@@ -1,0 +1,93 @@
+name: Azure Backend CI/CD
+
+on:
+  push:
+    branches:
+      - feat/deployment_fixes
+      - Feat/deployment_fixes
+  workflow_dispatch:
+
+env:
+  ACR_LOGIN_SERVER: sinlearnbackendacr.azurecr.io
+  IMAGE_NAME: sinhala-ed-assistant
+  WHISPER_MODEL_DIR: app/models/whisper-sinhala-accent-model
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment secrets
+        shell: bash
+        run: |
+          missing=0
+
+          if [ -z "${{ secrets.ACR_USERNAME }}" ]; then
+            echo "::error::Missing GitHub secret ACR_USERNAME."
+            missing=1
+          fi
+
+          if [ -z "${{ secrets.ACR_PASSWORD }}" ]; then
+            echo "::error::Missing GitHub secret ACR_PASSWORD."
+            missing=1
+          fi
+
+          if [ ! -f "${WHISPER_MODEL_DIR}/model.safetensors" ] && [ -z "${{ secrets.WHISPER_MODEL_ZIP_URL }}" ]; then
+            echo "::error::Whisper model is not in git and WHISPER_MODEL_ZIP_URL is missing."
+            echo "Upload the model folder as a zip to private storage, then add a time-limited download URL as the WHISPER_MODEL_ZIP_URL GitHub secret."
+            missing=1
+          fi
+
+          exit "$missing"
+
+      - name: Restore Whisper model
+        if: ${{ !hashFiles('app/models/whisper-sinhala-accent-model/model.safetensors') }}
+        shell: bash
+        run: |
+          mkdir -p "${WHISPER_MODEL_DIR}"
+          curl -L "${{ secrets.WHISPER_MODEL_ZIP_URL }}" -o /tmp/whisper-model.zip
+          unzip -q /tmp/whisper-model.zip -d /tmp/whisper-model
+
+          if [ -f /tmp/whisper-model/model.safetensors ]; then
+            cp -R /tmp/whisper-model/. "${WHISPER_MODEL_DIR}/"
+          else
+            found_dir="$(find /tmp/whisper-model -name model.safetensors -printf '%h\n' | head -n 1)"
+            if [ -z "$found_dir" ]; then
+              echo "::error::Downloaded model zip does not contain model.safetensors."
+              exit 1
+            fi
+            cp -R "$found_dir"/. "${WHISPER_MODEL_DIR}/"
+          fi
+
+          test -f "${WHISPER_MODEL_DIR}/model.safetensors"
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Set image tags
+        id: image
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          echo "latest=${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
+          echo "sha=${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image.outputs.latest }}
+            ${{ steps.image.outputs.sha }}

@@ -198,6 +198,7 @@ def process_ocr_for_images_with_tables(
     trocr_predict: Optional[Callable[[np.ndarray], str]] = None,
     region_conf_threshold: float = 0.7,
 ) -> tuple:
+    print(f"LANG VALUE: {lang}")
     """
     OCR pipeline with:
     - Table detection

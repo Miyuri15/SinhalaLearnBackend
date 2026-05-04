@@ -20,7 +20,7 @@ COPY pyproject.toml README.md ./
 RUN uv venv /opt/venv && \
     . /opt/venv/bin/activate && \
     uv pip install --no-cache --index-url https://download.pytorch.org/whl/cpu \
-    torch>=2.0.0 torchvision>=0.15.0 && \
+    "torch>=2.0.0" "torchvision>=0.15.0" && \
     uv pip install --no-cache .
 
 # Final stage
@@ -33,6 +33,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
+    ffmpeg \
+    libsndfile1 \
     tesseract-ocr \
     poppler-utils \
     libgl1 \

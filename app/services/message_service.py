@@ -1,8 +1,11 @@
 # app/services/message_service.py
+from datetime import datetime, timezone
 import logging
 from typing import Optional, List, Dict
 from uuid import UUID
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+
 logger = logging.getLogger(__name__)
 
 from app.repositories.message_repository import MessageRepository
@@ -48,42 +51,66 @@ class MessageService:
             from app.services.chat_session_service import ChatSessionService
             session_service = ChatSessionService(self.db)
         
-        self.logger.debug(" start: session_id=%s user_id=%s modality=%s", session_id, user_id, modality)
-        # If session doesn't exist, create it on-demand using sensible defaults.
-        # Otherwise verify ownership.
-        session_exists = session_service.get_session(session_id)
-        if not session_exists:
-            # create session owned by this user. Defaults mirror ChatSessionCreate schema
-            session_service.create_session(
-                user_id=user_id,
-                mode="learning",
-                channel="text",
-                title=None,
-                description=None,
-                grade=None,
-                subject=None,
+        try:
+            self.logger.debug(" start: session_id=%s user_id=%s modality=%s", session_id, user_id, modality)
+            # If session doesn't exist, create it on-demand using sensible defaults.
+            # Otherwise verify ownership.
+            session = session_service.get_session(session_id)
+            if not session:
+                # create session owned by this user. Defaults mirror ChatSessionCreate schema
+                session = session_service.create_session(
+                    user_id=user_id,
+                    mode="learning",
+                    channel="text",
+                    title=None,
+                    description=None,
+                    grade=None,
+                    subject=None,
+                )
+                session_id = session.id
+            else:
+                # ownership check
+                if not session_service.validate_ownership(session_id, user_id):
+                    raise PermissionError("You don't have permission to access this session")
+            
+            # Validate message payload (coercion handled in validator)
+            self.validate_message_payload(modality, content, audio_url)
+            
+            # Create message
+            self.logger.debug("Creating user message for session_id=%s user_id=%s", session_id, user_id)
+            msg = self.repository.create_user_message(
+                session_id=session_id,
+                content=content,
+                modality=modality,
+                grade_level=grade_level,
+                audio_url=audio_url,
+                transcript=transcript,
+                audio_duration_sec=audio_duration_sec,
             )
-        else:
-            # ownership check
-            if not session_service.validate_ownership(session_id, user_id):
-                raise PermissionError("You don't have permission to access this session")
-        
-        # Validate message payload (coercion handled in validator)
-        self.validate_message_payload(modality, content, audio_url)
-        
-        # Create message
-        self.logger.debug("Creating user message for session_id=%s user_id=%s", session_id, user_id)
-        msg = self.repository.create_user_message(
-            session_id=session_id,
-            content=content,
-            modality=modality,
-            grade_level=grade_level,
-            audio_url=audio_url,
-            transcript=transcript,
-            audio_duration_sec=audio_duration_sec,
-        )
-        self.logger.info("User message created: %s (session=%s)", getattr(msg, "id", None), session_id)
-        return msg
+            session.updated_at = datetime.now(timezone.utc)
+            self.db.commit()
+            self.db.refresh(msg)
+            self.logger.info("User message created: %s (session=%s)", getattr(msg, "id", None), session_id)
+            return msg
+        except PermissionError as e:
+            self.db.rollback()
+            self.logger.warning("Permission denied for user %s on session %s", user_id, session_id)
+            raise
+
+        except ValueError as e:
+            self.db.rollback()
+            self.logger.warning("Validation error: %s", str(e))
+            raise
+
+        except SQLAlchemyError as e:
+            self.db.rollback()
+            self.logger.exception("Database error while creating message")
+            raise
+
+        except Exception as e:
+            self.db.rollback()
+            self.logger.exception("Unexpected error while creating message")
+            raise
 
     def create_user_message(
         self,
@@ -286,6 +313,7 @@ class MessageService:
             bm25_k=bm25_k,
             final_k=final_k,
             grade_level=message.grade_level,
+            user_id=user_id,
         )
 
         logger.info("RAG response generated for message %s", message_id)

@@ -1,7 +1,6 @@
 import torch
 from typing import List
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from app.core.config import settings
 
 
@@ -11,6 +10,8 @@ class EmbeddingService:
     @classmethod
     def get_model(cls):
         if cls._model is None:
+            from sentence_transformers import SentenceTransformer
+
             model_name = settings.MODEL_EMBEDDING_NAME
             print(f"[DEBUG] Loading embedding model: {model_name}")
             try:

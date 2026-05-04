@@ -10,6 +10,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from app.schemas.auth import (
+    BootstrapAdminRequest,
     SignUpRequest,
     SignInRequest,
     ForgotPasswordRequest,
@@ -18,6 +19,7 @@ from app.schemas.auth import (
     AuthTokensResponse,
     SignOutResponse,
 )
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import (
     verify_password,
@@ -35,6 +37,23 @@ from app.services.email_service import EmailService
 router = APIRouter()
 
 
+def _auth_tokens_for_user(user, db: Session) -> AuthTokensResponse:
+    access_token, expires_in = create_access_token(user.id)
+    refresh_token, jti, expires_at = create_refresh_token(user.id)
+
+    token_repo = RefreshTokenRepository(db)
+    token_repo.create_token(user.id, jti, expires_at)
+
+    return AuthTokensResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=expires_in,
+        user_id=str(user.id),
+        tier=getattr(user, "tier", None),
+        role=getattr(user, "role", None),
+    )
+
+
 @router.post("/signup", response_model=AuthTokensResponse)
 def signup(payload: SignUpRequest, db: Session = Depends(get_db)):
     """Register a new user account."""
@@ -49,18 +68,7 @@ def signup(payload: SignUpRequest, db: Session = Depends(get_db)):
         password=payload.password,
     )
     
-    # Issue tokens and store refresh token
-    access_token, expires_in = create_access_token(user.id)
-    refresh_token, jti, expires_at = create_refresh_token(user.id)
-    
-    token_repo = RefreshTokenRepository(db)
-    token_repo.create_token(user.id, jti, expires_at)
-    
-    return AuthTokensResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_in=expires_in,
-    )
+    return _auth_tokens_for_user(user, db)
 
 
 @router.post("/signin", response_model=AuthTokensResponse)
@@ -79,18 +87,41 @@ def signin(payload: SignInRequest, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
 
-    # Issue tokens and store refresh token
-    access_token, expires_in = create_access_token(user.id)
-    refresh_token, jti, expires_at = create_refresh_token(user.id)
-    
-    token_repo = RefreshTokenRepository(db)
-    token_repo.create_token(user.id, jti, expires_at)
+    return _auth_tokens_for_user(user, db)
 
-    return AuthTokensResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_in=expires_in,
+
+@router.post("/bootstrap-admin", response_model=AuthTokensResponse)
+def bootstrap_admin(payload: BootstrapAdminRequest, db: Session = Depends(get_db)):
+    """
+    Create the first admin account.
+
+    This endpoint is intentionally guarded by ADMIN_BOOTSTRAP_TOKEN and is only
+    usable while no admin exists.
+    """
+    if not settings.ADMIN_BOOTSTRAP_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin bootstrap is not configured",
+        )
+    if payload.bootstrap_token != settings.ADMIN_BOOTSTRAP_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid admin bootstrap token",
+        )
+
+    service = UserService(db)
+    if service.admin_exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An admin user already exists",
+        )
+
+    user = service.bootstrap_admin(
+        email=payload.email,
+        full_name=payload.full_name,
+        password=payload.password,
     )
+    return _auth_tokens_for_user(user, db)
 
 
 @router.post("/forgot-password")
@@ -188,12 +219,17 @@ def refresh_token(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
     if not token_repo.is_token_valid(jti):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked or expired")
 
+    service = UserService(db)
+    user = service.get_user(UUID(user_id))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
     # Issue new tokens
-    access_token, expires_in = create_access_token(UUID(user_id))
-    refresh_token_str, new_jti, expires_at = create_refresh_token(UUID(user_id))
+    access_token, expires_in = create_access_token(user.id)
+    refresh_token_str, new_jti, expires_at = create_refresh_token(user.id)
     
     # Store new refresh token
-    token_repo.create_token(UUID(user_id), new_jti, expires_at)
+    token_repo.create_token(user.id, new_jti, expires_at)
 
     logger.info("✓ Refresh token used to issue new access token for user %s", user_id)
 
@@ -201,6 +237,9 @@ def refresh_token(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
         access_token=access_token,
         refresh_token=refresh_token_str,
         expires_in=expires_in,
+        user_id=str(user.id),
+        tier=getattr(user, "tier", None),
+        role=getattr(user, "role", None),
     )
 
 

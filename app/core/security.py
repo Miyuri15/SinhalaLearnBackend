@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.repositories.user_repository import UserRepository
+from app.shared.models.user import ADMIN_ROLE
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 http_bearer = HTTPBearer(auto_error=True)
@@ -93,3 +94,12 @@ def get_current_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
+
+
+def require_admin_user(current_user=Depends(get_current_user)):
+    if getattr(current_user, "role", None) != ADMIN_ROLE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    return current_user

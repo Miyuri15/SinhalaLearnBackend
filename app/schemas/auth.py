@@ -15,6 +15,13 @@ class SignInRequest(BaseModel):
     password: str
 
 
+class BootstrapAdminRequest(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = None
+    password: str
+    bootstrap_token: str
+
+
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
@@ -33,6 +40,9 @@ class AuthTokensResponse(BaseModel):
     refresh_token: Optional[str] = None
     token_type: str = "bearer"
     expires_in: Optional[int] = None
+    user_id: Optional[str] = None
+    tier: Optional[str] = None
+    role: Optional[str] = None
 
 
 class SignOutResponse(BaseModel):

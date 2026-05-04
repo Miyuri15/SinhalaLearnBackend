@@ -3,6 +3,7 @@ import torch
 from typing import List, Dict
 import subprocess
 import os
+import tempfile
 
 from app.core.whisper_loader import WhisperLoader
 from app.core.utils import normalize_sinhala
@@ -20,7 +21,6 @@ from jiwer import wer, cer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModel
 
 # Hybrid retrieval helpers (lexical + dense + cross-encoder rerank)
 from app.components.voice_qa.services.hybrid_retrieval import (
@@ -37,9 +37,6 @@ class VoiceService:
     def transcribe_audio(file_path: str):
         processor, model, device = WhisperLoader.load()
         
-        # Enable mixed precision (FP16) for GPU
-        model.half()
-        
         # Method 1: Try using soundfile directly first
         try:
             import soundfile as sf
@@ -51,8 +48,11 @@ class VoiceService:
                 sr = 16000
         except:
             # Method 2: Use FFmpeg directly to convert to WAV
+            temp_converted = None
             try:
-                temp_converted = "temp_converted.wav"
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    temp_converted = tmp.name
+
                 cmd = [
                     'ffmpeg', '-i', file_path, 
                     '-ar', '16000',  # Sample rate
@@ -68,8 +68,11 @@ class VoiceService:
                 audio, sr = sf.read(temp_converted)
                 
                 # Clean up
-                os.remove(temp_converted)
+                if temp_converted and os.path.exists(temp_converted):
+                    os.remove(temp_converted)
             except Exception as e:
+                if temp_converted and os.path.exists(temp_converted):
+                    os.remove(temp_converted)
                 # Method 3: Fall back to librosa with explicit backend
                 import librosa
                 import audioread
@@ -79,8 +82,9 @@ class VoiceService:
         # Process the audio file with WhisperProcessor
         inputs = processor(audio, sampling_rate=16000, return_tensors="pt").to(device)
         
-        # Convert the input features to FP16
-        inputs = {k: v.half() for k, v in inputs.items()}
+        # Match model precision: FP16 only when CUDA is available.
+        if device == "cuda":
+            inputs = {k: v.half() for k, v in inputs.items()}
         
         with torch.no_grad():
             ids = model.generate(inputs["input_features"])
@@ -93,30 +97,50 @@ class VoiceService:
     def standardize_southern_sinhala(text: str, context_hints: str = ""):
         normalized = normalize_sinhala(text)
 
-        # We add a section specifically for the "Vocabulary" found in the documents
         prompt = f"""
-        You are a Sinhala transcription corrector. Your goal is to fix phonetic errors while PRESERVING the original meaning.
+    ### INSTRUCTION
+    You are a specialized Sinhala linguistic utility. Your ONLY task is to take a noisy, phonetically incorrect transcription and output the clean, standard literary Sinhala version (ලිඛිත සිංහල).
 
-        CONTEXT VOCABULARY (Prioritize these terms if the transcription sounds similar):
-        {context_hints}
+    ### CONTEXT VOCABULARY
+    {context_hints}
 
-        Constraints:
-        1. If a word sounds like a name or term from the CONTEXT VOCABULARY above, use the context term (e.g., if you hear 'මා නැමැති රජු' but the context is about 'මානවම්ම රජු', use 'මානවම්ම රජු').
-        2. Convert Southern-accented verb endings to Standard Literary Sinhala.
-        3. Return ONLY the corrected Sinhala text.
+    ### RULES
+    1. **NO EXPLANATIONS:** Do not say "Here is the correction" or "Analysis". Do not provide bullet points.
+    2. **STRICT OUTPUT:** Return ONLY the corrected Sinhala string. No other text.
+    3. **FUZZY MATCHING:** If the transcription sounds like a name in the CONTEXT VOCABULARY, use the correct name (e.g., if 'ලංම කරන' sounds like 'ලම්බකර්ණ', use 'ලම්බකර්ණ').
+    4. **MAINTAIN INTENT:** Do not change the user's question, just fix the grammar and spelling.
 
-        Input: {normalized}
-        """
+    ### EXAMPLES
+    Input: මකේ නම මොකක්ද
+    Output: මගේ නම කුමක්ද?
+
+    Input: මෙහේ සදහන්මන ලංම කරන වන්ෂයට ඇය ත්රජුවරුම් කවුරුන්ද?
+    Output: මෙහි සඳහන් වන ලම්බකර්ණ වංශයට අයත් රජවරුන් කවුරුන්ද?
+
+    ### TARGET INPUT
+    {normalized}
+
+    ### FINAL CORRECTED OUTPUT:
+    """
 
         gemini = GeminiClient()
         response = gemini.generate_content(prompt)
+        
+        # Use split or strip to ensure no trailing garbage text
         result = (response.get("text") or "").strip()
+        
+        # Safety: if the model still outputs a paragraph, take the last line or clean it
+        if "\n" in result:
+            # Sometimes models repeat the prompt; we just want the final line
+            result = result.split("\n")[-1].replace("Output:", "").strip()
 
         return normalized, result
 
     @staticmethod
     def _load_embedding_model():
         if VoiceService._embedding_model is None:
+            from transformers import AutoTokenizer, AutoModel
+
             VoiceService._embedding_tokenizer = AutoTokenizer.from_pretrained(
                 "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
             )
