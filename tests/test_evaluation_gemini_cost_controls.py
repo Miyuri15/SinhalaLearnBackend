@@ -9,6 +9,7 @@ from app.components.document_processing.services import classifier_service
 def _load_grading_service_class():
     fake_embeddings = types.ModuleType("app.shared.ai.embeddings")
     fake_embeddings.xlmr = MagicMock()
+    fake_embeddings.get_xlmr_model = lambda *args, **kwargs: MagicMock()
     fake_embeddings.ml_semaphore = None
     fake_embeddings.ensure_sentences_cached = lambda *args, **kwargs: None
     fake_embeddings._embedding_cache = {}
@@ -275,6 +276,83 @@ def test_question_parsing_uses_configured_model(monkeypatch):
     assert calls[0]["model_name"] == "gemini-2.5-flash"
 
 
+def test_exam_normalization_infers_uniform_paper_i_marks_from_total():
+    result = classifier_service._normalize_extracted_exam_result(
+        {
+            "Paper_I": {
+                "config": {
+                    "total_marks": 40,
+                    "total_questions_available": 20,
+                    "selection_rules": {"mode": "all"},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": 2 if index <= 3 else 0,
+                    }
+                    for index in range(1, 21)
+                },
+            }
+        }
+    )
+
+    assert result["Paper_I"]["config"]["total_questions_available"] == 20
+    assert all(
+        question["marks"] == 2
+        for question in result["Paper_I"]["questions"].values()
+    )
+
+
+def test_exam_normalization_repairs_overall_total_leaked_into_paper_i():
+    result = classifier_service._normalize_extracted_exam_result(
+        {
+            "Paper_I": {
+                "config": {
+                    "total_marks": 100,
+                    "total_questions_available": 20,
+                    "selection_rules": {"mode": "all"},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": None,
+                    }
+                    for index in range(1, 21)
+                },
+            },
+            "Paper_II": {
+                "config": {
+                    "total_marks": 60,
+                    "total_questions_available": 8,
+                    "selection_rules": {"mode": "any", "count": 6},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": 12,
+                        "sub_questions": {
+                            "1": {"text": "A", "marks": 4},
+                            "2": {"text": "B", "marks": 4},
+                            "3": {"text": "C", "marks": 4},
+                        },
+                    }
+                    for index in range(1, 9)
+                },
+            },
+        }
+    )
+
+    assert result["Paper_I"]["config"]["total_marks"] == 40
+    assert all(
+        question["marks"] == 2
+        for question in result["Paper_I"]["questions"].values()
+    )
+    assert result["Paper_II"]["config"]["total_marks"] == 60
+
+
 def test_reference_extraction_respects_request_budget(monkeypatch):
     calls = []
 
@@ -361,10 +439,267 @@ def test_reference_extraction_prompt_uses_per_question_evidence(monkeypatch):
     assert len(prompts) == 1
     assert "Evidence:\nEvidence for q-1" in prompts[0]
     assert "Do NOT use internal knowledge." in prompts[0]
+    assert "direct short answer only" in prompts[0]
+    assert "Do not write explanations or essay sentences." in prompts[0]
     assert "{syllabus_for_prompt}" not in prompts[0]
 
 
-def test_reference_extraction_drops_not_covered_and_uses_context_fallback(monkeypatch):
+def test_schema_reference_shaping_compacts_short_answer_prose():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "Correct direct answer. This extra explanatory sentence should not appear in Paper I.",
+        {"max_marks": 2, "part_name": "Paper_I", "question_type": "short"},
+    )
+
+    assert result == "Correct direct answer."
+
+
+def test_schema_reference_shaping_rejects_inline_not_found():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "School: NOT_FOUND, Society: Colombo Buddhist Theosophical Society",
+        {"max_marks": 2, "part_name": "Paper_I", "question_type": "short", "question_text": "Name two items"},
+    )
+
+    assert result == ""
+
+
+def test_schema_reference_shaping_keeps_only_one_requested_reason():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "වැසි සමය ආරම්භ වීම, ලෙඩ රෝග පැතිර යාම, ආහාර හිඟ වීම",
+        {"max_marks": 2, "part_name": "Paper_I", "question_type": "short", "question_text": "එක් හේතුවක් සඳහන් කරන්න"},
+    )
+
+    assert result == "වැසි සමය ආරම්භ වීම"
+
+
+def test_schema_reference_shaping_rejects_missing_required_short_items():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "Only one clause is present.",
+        {"max_marks": 2, "part_name": "Paper_I", "question_type": "short", "question_text": "වගන්ති දෙකක් සඳහන් කරන්න"},
+    )
+
+    assert result == ""
+
+
+def test_schema_reference_shaping_turns_paper_ii_prose_into_covering_points():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "First required point. Second required point. Third required point.",
+        {"max_marks": 4, "part_name": "Paper_II", "question_type": "essay"},
+    )
+
+    assert result == (
+        "1. First required point.\n"
+        "2. Second required point.\n"
+        "3. Third required point."
+    )
+
+
+def test_reference_extraction_uses_bounded_golden_fallback(monkeypatch):
+    calls = []
+
+    def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
+        calls.append(reason)
+        if reason == "bounded_golden_reference_fallback":
+            assert "Use ONLY the uploaded source" in prompt
+            return '{"ref_1": "Bounded syllabus answer"}'
+        return '{"ref_1": "NOT_FOUND"}'
+
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    grading_module = sys.modules["app.services.evaluation.grading_service"]
+    monkeypatch.setattr(grading_module, "gemini_generate_evaluation", fake_gemini_generate_evaluation)
+    service = GradingService(db)
+
+    result = service._batch_extract_reference_points(
+        [
+            {
+                "key": "q-1",
+                "target": SimpleNamespace(correct_answer=None),
+                "question_text": "Question text",
+                "max_marks": 2,
+                "display_number": "1",
+                "part_name": "Paper_I",
+                "question_type": "short",
+            }
+        ],
+        "Uploaded syllabus source with the relevant topic.",
+    )
+
+    assert result == {"q-1": "Bounded syllabus answer"}
+    assert "bounded_golden_reference_fallback" in calls
+
+
+def test_reference_extraction_does_not_use_unbounded_single_question_repair(monkeypatch):
+    calls = []
+
+    def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
+        calls.append(reason)
+        return '{"ref_1": "NOT_FOUND"}'
+
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    grading_module = sys.modules["app.services.evaluation.grading_service"]
+    monkeypatch.setattr(grading_module, "gemini_generate_evaluation", fake_gemini_generate_evaluation)
+    service = GradingService(db)
+
+    result = service._batch_extract_reference_points(
+        [
+            {
+                "key": "q-1",
+                "target": SimpleNamespace(correct_answer=None),
+                "question_text": "Question text",
+                "max_marks": 2,
+                "display_number": "1",
+                "part_name": "Paper_I",
+                "question_type": "short",
+            }
+        ],
+        "Uploaded syllabus source with the relevant topic.",
+    )
+
+    assert result == {}
+    assert not any(str(call).startswith("single_question_reference_repair_") for call in calls)
+
+
+def test_paper_i_max_marks_are_repaired_from_question_part():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    target = SimpleNamespace(
+        max_marks=5,
+        part_name="Paper_I",
+        question_text="Short answer question",
+        sub_questions=[],
+    )
+
+    assert service._resolve_max_marks(target) == 2
+
+
+def test_paper_i_max_marks_prefers_explicit_question_text_marks():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    target = SimpleNamespace(
+        max_marks=5,
+        part_name="Paper_I",
+        question_text="Short answer question (01 marks)",
+        sub_questions=[],
+    )
+
+    assert service._resolve_max_marks(target) == 1
+
+
+def test_build_reference_map_uses_syllabus_text_for_extraction(monkeypatch):
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+    captured = {}
+
+    def fake_batch_extract(questions, reference_source):
+        captured["reference_source"] = reference_source
+        return {"q-1": "Official marking answer"}
+
+    monkeypatch.setattr(service, "_batch_extract_reference_points", fake_batch_extract)
+
+    target = SimpleNamespace(id="q-1", correct_answer=None, question_type="short")
+    result = service.build_reference_map_for_targets(
+        eval_session_id=SimpleNamespace(),
+        syllabus_text="Syllabus note evidence",
+        rubric_text="Official marking schema evidence",
+        targets=[
+            {
+                "key": "q-1",
+                "target": target,
+                "question_text": "Question text",
+                "max_marks": 2,
+                "question_number": "1",
+                "part_name": "Paper_I",
+            }
+        ],
+    )
+
+    assert result == {"q-1": "Official marking answer"}
+    assert captured["reference_source"] == "Syllabus note evidence"
+    assert "Official marking schema evidence" not in captured["reference_source"]
+
+
+def test_build_reference_map_leaves_blank_when_no_syllabus_reference_found(monkeypatch):
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    monkeypatch.setattr(service, "_batch_extract_reference_points", lambda questions, source: {})
+    monkeypatch.setattr(service, "_get_reference_context", lambda *args, **kwargs: "Unsafe fallback excerpt")
+
+    target = SimpleNamespace(id="q-1", correct_answer=None, question_type="essay")
+    result = service.build_reference_map_for_targets(
+        eval_session_id=SimpleNamespace(),
+        syllabus_text="Syllabus note evidence",
+        rubric_text="",
+        targets=[
+            {
+                "key": "q-1",
+                "target": target,
+                "question_text": "Question text",
+                "max_marks": 5,
+                "question_number": "1(a)",
+                "part_name": "Paper_II",
+            }
+        ],
+    )
+
+    assert result == {"q-1": ""}
+
+
+def test_build_reference_map_does_not_use_question_correct_answer_without_syllabus(monkeypatch):
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    monkeypatch.setattr(service, "_batch_extract_reference_points", lambda questions, source: {})
+    target = SimpleNamespace(id="q-1", correct_answer="Stale generated answer", question_type="short")
+
+    result = service.build_reference_map_for_targets(
+        eval_session_id=SimpleNamespace(),
+        syllabus_text="",
+        rubric_text="",
+        targets=[
+            {
+                "key": "q-1",
+                "target": target,
+                "question_text": "Question text",
+                "max_marks": 2,
+                "question_number": "1",
+                "part_name": "Paper_I",
+            }
+        ],
+    )
+
+    assert result == {"q-1": ""}
+
+
+def test_reference_extraction_drops_not_covered_without_context_fallback(monkeypatch):
     def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
         return '{"ref_1": "මෙම සාක්ෂිය තුළ මැකඩම් මාර්ග තැනීම පිළිබඳ තොරතුරු අඩංගු නොවේ."}'
 
@@ -393,10 +728,10 @@ def test_reference_extraction_drops_not_covered_and_uses_context_fallback(monkey
         "Long syllabus content",
     )
 
-    assert result == {"q-1": "Retrieved syllabus evidence"}
+    assert result == {}
 
 
-def test_reference_extraction_drops_additional_sinhala_placeholder_variants(monkeypatch):
+def test_reference_extraction_drops_additional_sinhala_placeholder_variants_without_context_fallback(monkeypatch):
     def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
         return '{"ref_1": "මෙම සාධක වලින් එකක්වත් ලබා දී ඇති සාක්ෂිවල අඩංගු නොවේ."}'
 
@@ -425,7 +760,7 @@ def test_reference_extraction_drops_additional_sinhala_placeholder_variants(monk
         "Long syllabus content",
     )
 
-    assert result == {"q-1": "Recovered evidence block"}
+    assert result == {}
 
 
 def test_reference_extraction_maps_display_number_keys_back_to_question_ids(monkeypatch):
@@ -485,6 +820,32 @@ def test_reference_extraction_rejects_raw_page_fallback_context(monkeypatch):
     )
 
     assert result == {}
+
+
+def test_reference_extraction_recovers_pairs_from_truncated_json(monkeypatch):
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    parsed = service._safe_reference_json_loads(
+        '{"ref_1": "First reference", "ref_2": "Second reference", "ref_3": "unfinished'
+    )
+
+    assert parsed["ref_1"] == "First reference"
+    assert parsed["ref_2"] == "Second reference"
+
+
+def test_syllabus_fallback_keeps_clipped_context_without_marker():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+    service._build_reference_context_block = MagicMock(
+        return_value="Useful syllabus text about the answer. [Context Clipped]"
+    )
+
+    result = service._build_syllabus_fallback_reference({"max_marks": 2}, "source")
+
+    assert result == "Useful syllabus text about the answer."
 
 
 def test_generate_initial_marking_scheme_passes_target_to_reference_extraction(monkeypatch):

@@ -179,6 +179,111 @@ def _count_questions_with_subparts(questions: dict) -> int:
     return sum(1 for q in (questions or {}).values() if _question_has_sub_questions(q))
 
 
+def _coerce_positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _repair_uniform_plain_question_marks(paper_key: str, paper: dict) -> None:
+    if not isinstance(paper, dict):
+        return
+
+    questions = paper.get("questions", {}) or {}
+    config = paper.get("config", {}) or {}
+    if not isinstance(questions, dict) or not questions:
+        return
+
+    total_marks = _coerce_positive_int(config.get("total_marks"))
+    if not total_marks:
+        return
+
+    plain_questions = [
+        question
+        for question in questions.values()
+        if isinstance(question, dict) and not _question_has_sub_questions(question)
+    ]
+    if len(plain_questions) != len(questions):
+        return
+
+    question_count = len(plain_questions)
+    if total_marks % question_count != 0:
+        return
+
+    inferred_marks = total_marks // question_count
+    normalized_known_marks: list[int] = []
+    for question in plain_questions:
+        mark = _coerce_positive_int(question.get("marks"))
+        if mark is not None:
+            question["marks"] = mark
+            normalized_known_marks.append(mark)
+        else:
+            question["marks"] = None
+
+    if normalized_known_marks and any(mark != inferred_marks for mark in normalized_known_marks):
+        return
+
+    missing_count = sum(1 for question in plain_questions if question.get("marks") is None)
+    if missing_count:
+        for question in plain_questions:
+            if question.get("marks") is None:
+                question["marks"] = inferred_marks
+        logger.warning(
+            "Inferred %s mark(s) for %s plain question(s) in %s from total_marks=%s and question_count=%s.",
+            inferred_marks,
+            missing_count,
+            paper_key,
+            total_marks,
+            question_count,
+        )
+
+
+def _repair_overall_total_leak(cleaned_result: dict[str, dict]) -> None:
+    paper_totals: dict[str, int] = {}
+    for paper_key, paper in (cleaned_result or {}).items():
+        if not isinstance(paper, dict):
+            continue
+        config = paper.get("config", {}) or {}
+        total_marks = _coerce_positive_int(config.get("total_marks"))
+        if total_marks is not None:
+            paper_totals[str(paper_key)] = total_marks
+
+    if len(paper_totals) < 2:
+        return
+
+    for paper_key, total_marks in list(paper_totals.items()):
+        if total_marks < 100:
+            continue
+
+        other_total = sum(
+            value for key, value in paper_totals.items() if key != paper_key and value < total_marks
+        )
+        repaired_total = total_marks - other_total
+        if repaired_total <= 0 or repaired_total >= total_marks:
+            continue
+
+        paper = cleaned_result.get(paper_key) or {}
+        questions = paper.get("questions", {}) or {}
+        if not isinstance(questions, dict) or not questions:
+            continue
+
+        question_count = len(questions)
+        if repaired_total % question_count != 0:
+            continue
+
+        config = paper.setdefault("config", {})
+        config["total_marks"] = repaired_total
+        logger.warning(
+            "Repaired %s total_marks from overall total %s to section total %s using other paper totals=%s.",
+            paper_key,
+            total_marks,
+            repaired_total,
+            other_total,
+        )
+
+
 _PAPER_HEADER_WORDS = (
     "paper",
     "part",
@@ -526,6 +631,10 @@ def _normalize_extracted_exam_result(result: dict) -> dict:
         normalized_paper["config"] = config
         normalized_paper["questions"] = ordered_questions
         cleaned_result[str(paper_key)] = normalized_paper
+
+    _repair_overall_total_leak(cleaned_result)
+    for paper_key, paper in cleaned_result.items():
+        _repair_uniform_plain_question_marks(str(paper_key), paper)
 
     paper_i = cleaned_result.get("Paper_I")
     paper_ii = cleaned_result.get("Paper_II")
