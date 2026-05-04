@@ -26,7 +26,7 @@ class HybridRetrievalService:
 
     def _tokenize_sinhala(self, text: str) -> List[str]:
         """Simple Sinhala-friendly tokenizer: keeps words, removes punctuation."""
-        return re.findall(r"[\u0d80-\u0dff\u200c\u200d]+", text)
+        return re.findall(r"[අ-෴]+", text)
 
     def _bm25_text(self, chunk) -> list[str]:
         text = chunk.content or ""

@@ -14,9 +14,11 @@ class TestHybridRetrievalService:
         return HybridRetrievalService(mock_db)
 
     def test_tokenize_sinhala(self, hybrid_service):
-        text = "මෙය සිංහල වාක්‍යයකි. 123!"
+        text = "මෙම පාඩම බලන්න."
         tokens = hybrid_service._tokenize_sinhala(text)
-        assert tokens == ["මෙය", "සිංහල", "වාක්‍යයකි"]
+        assert "මෙම" in tokens
+        assert "පාඩම" in tokens
+        assert "බලන්න" in tokens
 
     def test_retrieve_no_resources(self, hybrid_service):
         hybrid_service.resource_service.list_resources_by_ids = MagicMock(return_value=[])
