@@ -1,5 +1,6 @@
 # app/shared/ai/gemini_client.py
 
+import socket
 from google import genai
 from google.genai import types
 
@@ -134,6 +135,10 @@ Title:"""
             )
 
             return (response.text or "").strip()
+        
+        except socket.gaierror as e:
+            logger.warning(f"DNS error (getaddrinfo failed): {e}")
+            return ""
 
         except Exception as e:
             error_msg = str(e).lower()

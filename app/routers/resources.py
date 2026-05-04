@@ -3,7 +3,7 @@
 import logging
 from typing import List, Optional
 from urllib.parse import quote
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status, Query
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status, Query, Request
 from fastapi.responses import FileResponse
 import os
 from sqlalchemy.orm import Session
@@ -612,6 +612,7 @@ def delete_resource(
 @router.post("/{resource_id}/process", response_model=ResourceProcessResponse)
 def process_resource(
     resource_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -634,7 +635,13 @@ def process_resource(
     """
     try:
         resource_service = ResourceService(db)
-        result = resource_service.process_resource(resource_id, current_user.id)
+        result = resource_service.process_resource(
+            resource_id,
+            current_user.id,
+            text_type_classifier=getattr(request.app.state, "text_type_classifier", None),
+            handwritten_ocr_predictor=getattr(request.app.state, "handwritten_ocr_predictor", None),
+            text_type_conf_threshold=getattr(request.app.state, "text_type_conf_threshold", 0.7),
+        )
         logger.info(f"Resource {resource_id} processing initiated by user {current_user.id}")
         return result
         
@@ -661,6 +668,7 @@ def process_resource(
 @router.post("/process/batch", response_model=List[ResourceProcessResponse])
 def process_resources_batch(
     payload: ResourceBatchProcessRequest,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -695,7 +703,13 @@ def process_resources_batch(
 
         results = []
         for resource_id in payload.resource_ids:
-            result = resource_service.process_resource(resource_id, current_user.id)
+            result = resource_service.process_resource(
+                resource_id,
+                current_user.id,
+                text_type_classifier=getattr(request.app.state, "text_type_classifier", None),
+                handwritten_ocr_predictor=getattr(request.app.state, "handwritten_ocr_predictor", None),
+                text_type_conf_threshold=getattr(request.app.state, "text_type_conf_threshold", 0.7),
+            )
             results.append(result)
 
         logger.info(

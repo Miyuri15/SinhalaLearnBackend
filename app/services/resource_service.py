@@ -253,7 +253,10 @@ class ResourceService:
         resource_id: UUID, 
         user_id: UUID, 
         resource_type: Optional[str] = None,
-        progress_callback: Optional[Callable[[str, float, Optional[Dict[str, Any]]], None]] = None
+        progress_callback: Optional[Callable[[str, float, Optional[Dict[str, Any]]], None]] = None,
+        text_type_classifier: Optional[Any] = None,
+        handwritten_ocr_predictor: Optional[Callable[[Any], str]] = None,
+        text_type_conf_threshold: float = 0.7,
     ):
         """Process resource (OCR, chunk, embed) after validation."""
         resource = self.get_resource_with_ownership_check(resource_id, user_id)
@@ -261,7 +264,12 @@ class ResourceService:
         # Delegate to document processor service
         from app.components.document_processing.services.resource_processor_service import ResourceProcessorService
         
-        processor = ResourceProcessorService(self.db)
+        processor = ResourceProcessorService(
+            self.db,
+            text_type_classifier=text_type_classifier,
+            handwritten_ocr_predictor=handwritten_ocr_predictor,
+            text_type_conf_threshold=text_type_conf_threshold,
+        )
         result = processor.process_resource(resource, resource_type=resource_type, progress_callback=progress_callback)
         
         return result

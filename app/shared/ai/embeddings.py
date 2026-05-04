@@ -1,10 +1,12 @@
 # app/shared/ai/embeddings.py
 
+import logging
 import threading
 from app.core.gemini_client import GeminiClient
 from app.core.config import settings
 from google.genai import types
 import huggingface_hub
+logger = logging.getLogger(__name__)
 
 if settings.HF_TOKEN:
     huggingface_hub.login(token=settings.HF_TOKEN, add_to_git_credential=False)
@@ -27,11 +29,13 @@ def get_xlmr_model():
     if _xlmr is None:
         with _xlmr_lock:
             if _xlmr is None:
+                logger.info("Loading XLM-R sentence transformer model")
                 from sentence_transformers import SentenceTransformer
 
                 _xlmr = SentenceTransformer(
                     "sentence-transformers/paraphrase-xlm-r-multilingual-v1"
                 )
+                logger.info("Loaded XLM-R sentence transformer model")
     return _xlmr
 
 EMBED_MODEL = "gemini-embedding-001"
@@ -51,6 +55,7 @@ def generate_embedding(
     Generate a 768-dim embedding using Gemini and log API usage.
     """
     if not text or not text.strip():
+        logger.debug("Skipping embedding generation for empty text")
         return []
 
     import time
@@ -61,8 +66,10 @@ def generate_embedding(
     request_id = f"embedding-{int(request_start_time * 1000)}-{random.randint(1000, 9999)}"
 
     try:
+        logger.debug("Generating embedding via Gemini for %d characters", len(text))
         client = GeminiClient.get_client()
         if not client:
+            logger.warning("Gemini client unavailable; returning empty embedding")
             return []
 
         result = client.models.embed_content(
@@ -79,6 +86,13 @@ def generate_embedding(
             embedding_values = result.embeddings[0].values
 
         duration_ms = round((time.time() - request_start_time) * 1000, 2)
+
+        logger.info(
+            "Generated embedding via Gemini: status=%s dimensions=%d duration_ms=%.2f",
+            "success" if embedding_values else "empty_response",
+            len(embedding_values),
+            duration_ms,
+        )
 
         ApiUsageLogService.create_log(
             request_id=request_id,
@@ -111,6 +125,10 @@ def generate_embedding(
     except Exception as e:
         duration_ms = round((time.time() - request_start_time) * 1000, 2)
 
+        logger.exception(
+            "Gemini embedding generation failed after %.2f ms", duration_ms
+        )
+
         ApiUsageLogService.create_log(
             request_id=request_id,
             provider="gemini",
@@ -138,7 +156,6 @@ def generate_embedding(
             },
         )
 
-        print(f"[ERROR] Gemini Embedding failed: {e}")
         return []
 
 def semantic_similarity(a: str, b: str) -> float:
@@ -147,6 +164,7 @@ def semantic_similarity(a: str, b: str) -> float:
     (fast, offline, safe fallback).
     """
     if not a.strip() or not b.strip():
+        logger.debug("Semantic similarity skipped for empty input")
         return 0.0
 
     try:
@@ -168,9 +186,10 @@ def semantic_similarity(a: str, b: str) -> float:
                     with _cache_lock: _embedding_cache[b] = b_vec
 
         sim = float(util.cos_sim(a_vec, b_vec))
+        logger.debug("Computed semantic similarity: %.4f", sim)
         return min(sim * 1.2, 1.0)
     except Exception as e:
-        print(f"[ERROR] Semantic similarity failed: {e}")
+        logger.exception("Semantic similarity computation failed")
         return 0.5
 
 
@@ -180,6 +199,7 @@ def ensure_sentences_cached(sentences: list[str]):
     Drastically faster than encoding one by one.
     """
     if not sentences:
+        logger.debug("No sentences provided for embedding cache warmup")
         return
 
     # Deduplicate and filter already cached
@@ -190,10 +210,11 @@ def ensure_sentences_cached(sentences: list[str]):
                 to_encode.append(s)
 
     if not to_encode:
+        logger.debug("All %d sentences already present in embedding cache", len(set(sentences)))
         return
 
     # Batch encode with semaphore
-    print(f"[INFO] Batch encoding {len(to_encode)} new sentences...")
+    logger.info("Batch encoding %d new sentences into embedding cache", len(to_encode))
     with ml_semaphore:
         new_embs = get_xlmr_model().encode(
             to_encode, 
@@ -205,3 +226,5 @@ def ensure_sentences_cached(sentences: list[str]):
         with _cache_lock:
             for i, s in enumerate(to_encode):
                 _embedding_cache[s] = new_embs[i]
+
+    logger.info("Cached %d new sentence embeddings", len(to_encode))
