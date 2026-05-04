@@ -69,6 +69,7 @@ class StartEvaluationRequest(BaseModel):
 class ProcessDocumentsRequest(BaseModel):
     chat_session_id: UUID
     answer_resource_ids: List[UUID]
+    force_reprocess: bool = False
 
 
 class DocumentProcessingStatus(BaseModel):

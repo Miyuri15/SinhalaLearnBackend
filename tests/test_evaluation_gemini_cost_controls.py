@@ -183,6 +183,67 @@ def test_local_ocr_marker_fallback_recovers_missing_short_and_sub_answers():
     assert classifier_service._count_visible_ocr_answer_blocks(answer_text) == 4
 
 
+def test_local_ocr_marker_fallback_splits_inline_numeric_paper_ii_subparts():
+    flat_structure = [
+        {"id": "q3", "label": "3", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "q3-1", "label": "3(1)", "parent_main_label": "3", "is_sub_question": True},
+        {"id": "q3-2", "label": "3(2)", "parent_main_label": "3", "is_sub_question": True},
+        {"id": "q3-3", "label": "3(3)", "parent_main_label": "3", "is_sub_question": True},
+        {"id": "q4", "label": "4", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "q4-1", "label": "4(1)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q4-2", "label": "4(2)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q4-3", "label": "4(3)", "parent_main_label": "4", "is_sub_question": True},
+    ]
+    answer_text = (
+        "03. (1) mission answer. (2) buddhist revival answer. "
+        "(3) hindu and muslim revival answer. "
+        "04. (1) colebrooke answer. (2) plantation answer. (3) middle class answer."
+    )
+
+    recovered = classifier_service._map_answers_from_visible_ocr_markers(
+        answer_text,
+        flat_structure,
+        existing={},
+        overwrite_existing=True,
+    )
+
+    assert recovered["q3-2"] == "buddhist revival answer"
+    assert recovered["q3-3"] == "hindu and muslim revival answer"
+    assert recovered["q4-3"] == "middle class answer"
+    assert "04" not in recovered["q3-3"]
+
+
+def test_local_ocr_marker_fallback_uses_sub_labels_when_db_order_is_shuffled():
+    flat_structure = [
+        {"id": "q4", "label": "4", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "q4-3", "label": "4(3)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q4-1", "label": "4(1)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q4-2", "label": "4(2)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q5", "label": "5", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "q5-2", "label": "5(2)", "parent_main_label": "5", "is_sub_question": True},
+        {"id": "q5-3", "label": "5(3)", "parent_main_label": "5", "is_sub_question": True},
+        {"id": "q5-1", "label": "5(1)", "parent_main_label": "5", "is_sub_question": True},
+    ]
+    answer_text = (
+        "04. (1) colebrooke answer. (2) plantation answer. (3) middle class answer. "
+        "05. (1) maccallum answer. (2) donoughmore answer. (3) soulbury answer."
+    )
+
+    recovered = classifier_service._map_answers_from_visible_ocr_markers(
+        answer_text,
+        flat_structure,
+        existing={},
+        overwrite_existing=True,
+    )
+
+    assert recovered["q4-1"] == "colebrooke answer"
+    assert recovered["q4-2"] == "plantation answer"
+    assert recovered["q4-3"] == "middle class answer"
+    assert recovered["q5-1"] == "maccallum answer"
+    assert recovered["q5-2"] == "donoughmore answer"
+    assert recovered["q5-3"] == "soulbury answer"
+
+
 def test_question_parsing_uses_configured_model(monkeypatch):
     calls = []
 
@@ -552,3 +613,154 @@ II ශ්‍රකාටස - විග්‍රහාත්මක රචනා 
     assert set(backfilled["Paper_II"]["questions"]) == {"1", "2", "3"}
     assert backfilled["Paper_II"]["config"]["total_questions_available"] == 3
     assert set(backfilled["Paper_II"]["questions"]["2"]["sub_questions"]) == {"අ"}
+
+
+def test_backfill_paper_ii_questions_when_numbers_share_line_with_text():
+    text = """
+I part
+1. Short question.
+
+II part
+1. Main question one
+(1) Sub part one
+(2) Sub part two
+2. Main question two
+1) Numeric sub part one
+2) Numeric sub part two
+3. Main question three
+4. Main question four
+5. Main question five
+6. Main question six
+7. Main question seven
+8. Main question eight
+"""
+    parsed = {
+        "Paper_I": {"config": {}, "questions": {"1": {"text": "Short question."}}},
+        "Paper_II": {"config": {}, "questions": {"1": {"text": "only one"}}},
+    }
+
+    backfilled = classifier_service._backfill_missing_segmented_questions(parsed, text)
+
+    assert set(backfilled["Paper_II"]["questions"]) == {str(i) for i in range(1, 9)}
+    assert backfilled["Paper_II"]["config"]["total_questions_available"] == 8
+    assert set(backfilled["Paper_II"]["questions"]["2"]["sub_questions"]) == {"1", "2"}
+
+
+def test_question_paper_parser_splits_inline_numeric_subparts():
+    section = (
+        "02. (1) First essay subpart. (04 marks) "
+        "(2) Second essay subpart. (04 marks) "
+        "(3) Third essay subpart. (04 marks) "
+        "03. (1) Another first subpart. (04 marks) "
+        "(2) Another second subpart. (04 marks) "
+        "04. (1) One subpart only. (04 marks) "
+        "05. (1) First of four. (04 marks) "
+        "(2) Second of four. (04 marks) "
+        "(3) Third of four. (04 marks) "
+        "(4) Fourth of four. (04 marks) "
+        "06. (9) Ninth subpart. (04 marks) "
+        "(10) Tenth subpart. (04 marks)"
+    )
+
+    questions = classifier_service._extract_structured_main_questions_from_section(section)
+
+    assert set(questions) == {"2", "3", "4", "5", "6"}
+    assert set(questions["2"]["sub_questions"]) == {"1", "2", "3"}
+    assert questions["2"]["sub_questions"]["2"]["text"].startswith("Second essay subpart")
+    assert set(questions["3"]["sub_questions"]) == {"1", "2"}
+    assert set(questions["4"]["sub_questions"]) == {"1"}
+    assert set(questions["5"]["sub_questions"]) == {"1", "2", "3", "4"}
+    assert set(questions["6"]["sub_questions"]) == {"9", "10"}
+
+
+def test_segment_exam_text_detects_ocr_rakotasa_headers():
+    text = """
+1 \u0dbb\u0d9a\u0dcf\u0da7\u0dc3 - short answers
+1. Short question.
+
+2 \u0dbb\u0d9a\u0dcf\u0da7\u0dc3 - long answers
+01.
+(1) Long sub question.
+"""
+
+    sections = classifier_service._segment_exam_text_by_paper_headers(text)
+
+    assert set(sections) == {"Paper_I", "Paper_II"}
+    assert "Long sub question" in sections["Paper_II"]
+
+
+def test_segment_exam_text_infers_paper_ii_from_zero_padded_restart():
+    text = """
+History paper
+1. Short question one.
+2. Short question two.
+3. Short question three.
+4. Short question four.
+5. Short question five.
+6. Short question six.
+7. Short question seven.
+8. Short question eight.
+9. Short question nine.
+10. Short question ten.
+20. Short question twenty.
+
+Noisy OCR section header that is not readable
+01.
+(1) Long answer sub question one.
+(2) Long answer sub question two.
+02.
+(1) Second long answer.
+"""
+
+    sections = classifier_service._segment_exam_text_by_paper_headers(text)
+
+    assert set(sections) == {"Paper_I", "Paper_II"}
+    assert "20. Short question twenty" in sections["Paper_I"]
+    assert sections["Paper_II"].startswith("01.")
+    assert "02." in sections["Paper_II"]
+
+
+def test_local_question_extraction_repairs_short_answer_ocr_40_series_markers():
+    text = """
+1. First short question. (02 ලකුණු)
+2. Second short question. (02 ලකුණු)
+3. Third short question. (02 ලකුණු)
+4. Fourth short question. (02 ලකුණු)
+5. Fifth short question. (02 ලකුණු)
+6. Sixth short question. (02 ලකුණු)
+7. Seventh short question. (02 ලකුණු)
+8. Eighth short question. (02 ලකුණු)
+9. Ninth short question. (02 ලකුණු)
+40. Tenth short question. (02 ලකුණු)
+41. Eleventh short question. (02 ලකුණු)
+12. Twelfth short question. (02 ලකුණු)
+13. Thirteenth short question. (02 ලකුණු)
+14. Fourteenth short question. (02 ලකුණු)
+15. Fifteenth short question. (02 ලකුණු)
+16. Sixteenth short question. (02 ලකුණු)
+47. Seventeenth short question. (02 ලකුණු)
+48. Eighteenth short question. (02 ලකුණු)
+19. Nineteenth short question. (02 ලකුණු)
+20. Twentieth short question. (02 ලකුණු)
+"""
+
+    questions = classifier_service._extract_structured_main_questions_from_section(text)
+
+    assert set(questions) == {str(i) for i in range(1, 21)}
+    assert questions["10"]["text"].startswith("Tenth")
+    assert questions["17"]["text"].startswith("Seventeenth")
+    assert questions["18"]["text"].startswith("Eighteenth")
+
+
+def test_local_question_extraction_preserves_real_forty_series_markers():
+    text = """
+38. Thirty eighth question.
+39. Thirty ninth question.
+40. Fortieth question.
+41. Forty first question.
+"""
+
+    questions = classifier_service._extract_structured_main_questions_from_section(text)
+
+    assert set(questions) == {"38", "39", "40", "41"}
+    assert questions["40"]["text"].startswith("Fortieth")

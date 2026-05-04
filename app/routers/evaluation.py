@@ -164,7 +164,8 @@ def process_documents(
         return service.process_documents(
             chat_session_id=payload.chat_session_id,
             answer_resource_ids=payload.answer_resource_ids,
-            user_id=current_user.id
+            user_id=current_user.id,
+            force_reprocess=payload.force_reprocess,
         )
     except Exception as exc:
         logger.error(f"Failed to process documents: {exc}", exc_info=True)
@@ -185,7 +186,8 @@ def process_documents_stream(
         service.process_documents_generator(
             chat_session_id=payload.chat_session_id,
             answer_resource_ids=payload.answer_resource_ids,
-            user_id=current_user.id
+            user_id=current_user.id,
+            force_reprocess=payload.force_reprocess,
         ),
         media_type="text/event-stream"
     )
@@ -650,6 +652,7 @@ def list_answer_documents(
 @router.post("/answers/{answer_id}/parse", response_model=Dict[str, Any])
 def parse_answer_document(
     answer_id: UUID,
+    force_remap: bool = False,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -658,7 +661,7 @@ def parse_answer_document(
     """
     service = EvaluationWorkflowService(db)
     try:
-        return service.parse_answer_document(answer_id, current_user.id)
+        return service.parse_answer_document(answer_id, current_user.id, force_remap=force_remap)
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     except ValueError as exc:
@@ -666,6 +669,28 @@ def parse_answer_document(
     except Exception as exc:
         logger.error(f"Failed to parse answer {answer_id}: {exc}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse answer document")
+
+
+@router.post("/answers/{answer_id}/remap", response_model=AnswerMappingResponse)
+def remap_answer_document(
+    answer_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Force rebuild the student-answer mapping without re-uploading the answer sheet.
+    """
+    service = EvaluationWorkflowService(db)
+    try:
+        service.parse_answer_document(answer_id, current_user.id, force_remap=True)
+        return service.get_answer_mapping(answer_id, current_user.id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Failed to remap answer {answer_id}: {exc}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to remap answer document")
 
 
 @router.get("/answers/{answer_id}/mapping", response_model=AnswerMappingResponse)
