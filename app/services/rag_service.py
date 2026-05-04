@@ -25,7 +25,7 @@ class RAGService:
     """RAG orchestration with hybrid retrieval, grounded generation, and safety checks."""
     
     # Threshold for considering retrieved content relevant
-    RELEVANCE_THRESHOLD = 0.20  # Lowered to reduce false negatives; LLM will handle the final gate.
+    RELEVANCE_THRESHOLD = 0.20
 
 
     def __init__(self, db: Session):
