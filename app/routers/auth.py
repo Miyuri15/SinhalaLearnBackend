@@ -60,6 +60,7 @@ def signup(payload: SignUpRequest, db: Session = Depends(get_db)):
     service = UserService(db)
     existing = service.get_user_by_email(payload.email)
     if existing:
+        logger.warning("Attempt to register with already used email: %s", payload.email)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
 
     user = service.create_user(
@@ -77,9 +78,11 @@ def signin(payload: SignInRequest, db: Session = Depends(get_db)):
     service = UserService(db)
     user = service.get_user_by_email(payload.email)
     if not user or not verify_password(payload.password, user.password_hash):
+        logger.warning("Failed sign-in attempt with email: %s", payload.email)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     
     if not user.is_active:
+        logger.warning("Attempt to sign in with inactive account: %s", payload.email)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is inactive")
 
     # Update last login timestamp
@@ -99,11 +102,13 @@ def bootstrap_admin(payload: BootstrapAdminRequest, db: Session = Depends(get_db
     usable while no admin exists.
     """
     if not settings.ADMIN_BOOTSTRAP_TOKEN:
+        logger.error("Admin bootstrap attempted but ADMIN_BOOTSTRAP_TOKEN is not configured")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin bootstrap is not configured",
         )
     if payload.bootstrap_token != settings.ADMIN_BOOTSTRAP_TOKEN:
+        logger.error("Invalid admin bootstrap token provided: %s", payload.bootstrap_token)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid admin bootstrap token",
@@ -111,6 +116,7 @@ def bootstrap_admin(payload: BootstrapAdminRequest, db: Session = Depends(get_db
 
     service = UserService(db)
     if service.admin_exists():
+        logger.error("Attempt to bootstrap admin failed: admin user already exists")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An admin user already exists",
@@ -159,6 +165,8 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
         if settings.ENV == "development":
             response["reset_token"] = reset_token
             response["email_sent"] = email_sent
+    else:
+        logger.warning("Password reset requested for non-existent email: %s", payload.email)
     
     return response
 
@@ -170,12 +178,15 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     try:
         data = decode_token(payload.token)
         if data.get("type") != "reset":
+            logger.warning("Invalid token type used for password reset: %s", data.get("type"))
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
         user_id = data.get("sub")
         jti = data.get("jti")
         if not user_id or not jti:
+            logger.warning("Invalid token payload for password reset: %s", data)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
     except Exception:
+        logger.warning("Failed to decode password reset token: %s", payload.token)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
     # Check if token is valid in DB (not used, not revoked, not expired)
@@ -210,8 +221,10 @@ def refresh_token(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
         user_id = data.get("sub")
         jti = data.get("jti")
         if not user_id or not jti:
+            logger.warning("Invalid token payload for refresh token: %s", data)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
     except Exception:
+        logger.warning("Failed to decode refresh token: %s", payload.refresh_token)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
     # Verify token is still active in DB
@@ -222,6 +235,7 @@ def refresh_token(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
     service = UserService(db)
     user = service.get_user(UUID(user_id))
     if not user:
+        logger.warning("Attempt to use refresh token for non-existent user: %s", user_id)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
     # Issue new tokens
@@ -246,6 +260,7 @@ def refresh_token(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
 @router.post("/signout", response_model=SignOutResponse)
 def signout(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
     """Sign out: revoke all refresh tokens for the user."""
+    logger.info("User %s signing out, revoking all refresh tokens", current_user.id)
     token_repo = RefreshTokenRepository(db)
     token_repo.revoke_all_user_tokens(current_user.id)
     return SignOutResponse(success=True)
