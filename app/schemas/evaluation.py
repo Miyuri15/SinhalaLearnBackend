@@ -348,9 +348,15 @@ class EvaluationResultDetail(BaseModel):
     id: UUID
     answer_document_id: UUID
     total_score: Optional[Decimal] = None
+    total_max: Optional[float] = None
+    percentage_score: Optional[float] = None
     grade: Optional[str] = None
+    overall_feedback: Optional[str] = None
+    improvement_points: Optional[List[str]] = None
     feedback: Optional[dict] = None  # {overall_feedback, missing_concepts, improvement_points}
     marks_summary: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    marking_schema: Optional[Dict[str, Any]] = None
+    answer_mapping: Optional[Dict[str, Any]] = None
     evaluated_at: datetime
     question_feedbacks: list[QuestionScoreResponse] = []
 

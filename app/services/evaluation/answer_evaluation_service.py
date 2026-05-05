@@ -20,7 +20,7 @@ from app.repositories.evaluation.answer_evaluation_repository import AnswerEvalu
 from app.repositories.evaluation.marking_schema_repository import MarkingSchemaRepository
 from app.shared.models.session_resources import SessionResource
 from app.shared.models.resource_file import ResourceFile
-from app.shared.models.question_papers import Question
+from app.shared.models.question_papers import Question, QuestionPaper, SubQuestion
 from app.shared.models.evaluation_session import EvaluationSession, PaperConfig
 
 
@@ -562,8 +562,142 @@ class AnswerEvaluationService:
                 self._serialize_question_feedback(score)
                 for score in scores
                 if self._is_leaf_score(score)
-            ]
+            ],
+            "marking_schema": self._serialize_marking_schema_for_session(
+                result.answer_document.evaluation_session_id
+            ),
+            "answer_mapping": self._serialize_answer_mapping_for_document(
+                result.answer_document
+            ),
         }
+
+    def _serialize_marking_schema_for_session(self, evaluation_session_id: UUID) -> Optional[Dict]:
+        schema = self.marking_schema_repository.get_marking_schema_by_session(evaluation_session_id)
+        if not schema:
+            return None
+
+        items = self.marking_schema_repository.get_marking_schema_items(schema.id)
+        serialized_items = [
+            {
+                "id": str(item.id),
+                "question_id": str(item.question_id) if item.question_id else None,
+                "question_number": item.question_number,
+                "question_text": item.question_text,
+                "reference_text": item.reference_text,
+                "max_marks": float(item.max_marks) if item.max_marks is not None else None,
+                "part_name": item.part_name,
+                "part_display": self._format_paper_part(item.part_name),
+                "sort_order": item.sort_order,
+            }
+            for item in items
+        ]
+
+        return {
+            "id": str(schema.id),
+            "evaluation_session_id": str(schema.evaluation_session_id),
+            "resource_id": str(schema.resource_id) if schema.resource_id else None,
+            "is_confirmed": schema.is_confirmed,
+            "created_at": schema.created_at.isoformat() if schema.created_at else None,
+            "updated_at": schema.updated_at.isoformat() if schema.updated_at else None,
+            "items": serialized_items,
+        }
+
+    def _serialize_answer_mapping_for_document(self, answer_doc) -> Dict:
+        mapped_answers = answer_doc.mapped_answers or {}
+        eval_session = self.repository.db.query(EvaluationSession).filter(
+            EvaluationSession.id == answer_doc.evaluation_session_id
+        ).first()
+
+        question_lookup = {}
+        if eval_session:
+            question_papers = (
+                self.repository.db.query(QuestionPaper)
+                .filter(
+                    (QuestionPaper.evaluation_session_id == eval_session.id) |
+                    (QuestionPaper.chat_session_id == eval_session.session_id)
+                )
+                .all()
+            )
+            paper_ids = [paper.id for paper in question_papers]
+            questions = (
+                self.repository.db.query(Question)
+                .filter(Question.question_paper_id.in_(paper_ids))
+                .all()
+                if paper_ids else []
+            )
+
+            for question in questions:
+                part_name = getattr(question, "part_name", None)
+                question_number = str(question.question_number or "").strip()
+                question_lookup[str(question.id)] = {
+                    "type": "question",
+                    "paper_part": part_name,
+                    "question_number": question_number,
+                    "display_label": self._format_mapping_display(part_name, question_number),
+                    "question_text": question.question_text,
+                    "max_marks": question.max_marks,
+                    "_sort": self._mapping_sort_key(part_name, question_number),
+                }
+                self._add_sub_question_mapping_lookup(question_lookup, question, question.sub_questions or [])
+
+        details = []
+        for question_id, answer_text in mapped_answers.items():
+            info = question_lookup.get(str(question_id), {})
+            details.append({
+                "question_id": str(question_id),
+                "display_label": info.get("display_label", str(question_id)),
+                "paper_part": info.get("paper_part"),
+                "question_number": info.get("question_number"),
+                "question_text": info.get("question_text"),
+                "student_answer": answer_text,
+                "max_marks": float(info.get("max_marks")) if info.get("max_marks") is not None else None,
+                "is_mapped_to_current_question": bool(info),
+                "_sort": info.get("_sort", ((99, ""), (10**9, str(question_id)))),
+            })
+
+        details.sort(key=lambda item: (item.get("_sort"), item.get("display_label") or ""))
+        for item in details:
+            item.pop("_sort", None)
+
+        return {
+            "answer_document_id": str(answer_doc.id),
+            "details": details,
+            "raw_mapping": {str(key): value for key, value in mapped_answers.items()},
+        }
+
+    def _add_sub_question_mapping_lookup(self, lookup: Dict, question: Question, sub_questions: List[SubQuestion], parent_number: Optional[str] = None):
+        base_number = parent_number or str(question.question_number or "").strip()
+        part_name = getattr(question, "part_name", None)
+        for sub_question in sub_questions:
+            label = str(sub_question.label or "").strip()
+            number = f"{base_number}({label})" if base_number and label else (label or base_number)
+            lookup[str(sub_question.id)] = {
+                "type": "sub_question",
+                "paper_part": part_name,
+                "question_number": number,
+                "display_label": self._format_mapping_display(part_name, number),
+                "question_text": sub_question.sub_question_text,
+                "max_marks": sub_question.max_marks,
+                "_sort": self._mapping_sort_key(part_name, number),
+            }
+            self._add_sub_question_mapping_lookup(lookup, question, sub_question.children or [], number)
+
+    def _format_mapping_display(self, part_name: Optional[str], question_number: Optional[str]) -> str:
+        part_display = self._format_paper_part(part_name)
+        if part_display and question_number:
+            return f"{part_display} - {question_number}"
+        return question_number or part_display or "Unknown"
+
+    def _mapping_sort_key(self, part_name: Optional[str], question_number: Optional[str]):
+        part = self._normalize_part_key(part_name)
+        part_order = {"paper_i": 1, "paper_ii": 2, "paper_iii": 3, "paper_iv": 4}.get(part, 99)
+        number = str(question_number or "")
+        pieces = [
+            (0, int(piece)) if piece.isdigit() else (1, piece.lower())
+            for piece in re.split(r"(\d+)", number)
+            if piece
+        ]
+        return (part_order, pieces)
 
     def _score_priority(self, score) -> Tuple[int, float]:
         has_student_answer = 1 if getattr(score, "student_answer", None) and str(score.student_answer).strip() else 0

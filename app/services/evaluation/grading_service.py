@@ -691,11 +691,17 @@ class GradingService:
                 if final_marks is None:
                     final_marks = Decimal(str(final_snapped_ratio * item["max_marks"])).quantize(Decimal("0.5"))
                 # Feedback text from Gemini (text only, never marks)
+                item["final_marks"] = final_marks
                 meaning_data = eval_data_map.get(item["key"], {})
-                feedback = meaning_data.get("feedback", "පිළිතුර අගය කරන ලදී.")
-                if not feedback or self._feedback_contradicts_score(feedback, item):
+                feedback = meaning_data.get("feedback")
+                if (
+                    item["max_marks"] <= 2
+                    or not feedback
+                    or self._is_generic_feedback(feedback)
+                    or self._feedback_contradicts_score(feedback, item)
+                ):
                     logger.warning(
-                        "Replacing missing or score-contradictory feedback for Q%s. final_marks=%s/%s feedback=%s",
+                        "Replacing missing, generic, or score-contradictory feedback for Q%s. final_marks=%s/%s feedback=%s",
                         item["display_number"],
                         final_marks,
                         item["max_marks"],
@@ -1017,19 +1023,11 @@ class GradingService:
             logger.error(f"Overall feedback generation failed: {e}")
             overall_feedback = f"Total Score: {result.total_score}"
 
-        # Generate short-answer feedback locally - improved templates
+        # Generate short-answer feedback locally with the same explainable
+        # structure used by the score-aligned fallback.
         for item in scored_items:
             if item["max_marks"] <= 2:
-                ratio = float(item["awarded_marks"]) / max(1, item["max_marks"])
-                if ratio >= 0.99:
-                    fb = "නිවැරදි පිළිතුරයි. ප්‍රධාන කරුණු නිවැරදිව ඉදිරිපත් කර ඇත."
-                elif ratio >= 0.49:
-                    fb = "පිළිතුර අර්ධ වශයෙන් නිවැරදිය. වඩාත් සම්පූර්ණ පිළිතුරක් සඳහා තවදුරටත් විස්තර කිරීම අවශ්‍ය වේ."
-                else:
-                    fb = "පිළිතුර නිවැරදි නොවේ හෝ අදාළ නොවේ. විෂය කරුණු නැවත අධ්‍යයනය කරන්න."
-                eval_data_map[item["key"]] = {
-                    "feedback": f"**ප්‍රශ්නය {item['display_number']}** {fb}"
-                }
+                eval_data_map[item["key"]] = {"feedback": self._build_score_aligned_feedback(item)}
 
         current_scores = {qs.id: qs for qs in self.db.query(QuestionScore).filter(QuestionScore.evaluation_result_id == result.id).all()}
 
@@ -1044,8 +1042,13 @@ class GradingService:
             gemini_data = eval_data_map.get(item["key"], {})
             feedback = gemini_data.get("feedback")
             # IMPORTANT: Only update feedback text, never marks
-            if feedback:
-                qs.feedback = feedback
+            if (
+                not feedback
+                or self._is_generic_feedback(feedback)
+                or self._feedback_contradicts_score(feedback, item)
+            ):
+                feedback = self._build_score_aligned_feedback(item)
+            qs.feedback = feedback
 
         result.overall_feedback = overall_feedback
 
@@ -1223,12 +1226,12 @@ class GradingService:
             if sim >= 0.15:   return 0.0  + (sim - 0.15) * (0.50 / 0.15)   
             return 0.0
         else:
-            # SHORT ANSWER thresholds (Paper I or dynamic marks)
-            # KEY FIX: More generous for full marks (0.30 instead of 0.35) 
-            # as short MCQ answers have lower cosine sim variance.
-            if sim >= 0.30:   return 1.0
-            if sim >= 0.18:   return 0.50 + (sim - 0.18) * (0.50 / 0.12)   
-            if sim >= 0.08:   return 0.0  + (sim - 0.08) * (0.50 / 0.10)   
+            # Short factual answers are unsafe to grade from topic similarity
+            # alone. Keep semantic as a weak support signal; factual coverage
+            # decides the mark in _calculate_system_score().
+            if sim >= 0.72:   return 1.0
+            if sim >= 0.55:   return 0.55 + (sim - 0.55) * (0.45 / 0.17)
+            if sim >= 0.35:   return 0.20 + (sim - 0.35) * (0.35 / 0.20)
             return 0.0
 
 
@@ -1243,11 +1246,18 @@ class GradingService:
         - Paper I / Short: Below 0.20 gives zero
         - Paper II / Essay: Below 0.15 gives zero (more lenient for depth coverage)
         """
-        # New essay calibration: do not auto-promote essays to full marks from
-        # merely "good" similarity. Paper II should keep separation between
+        if max_marks <= 2:
+            if ratio >= 0.95:
+                return 1.0
+            if ratio >= 0.45:
+                return 0.5
+            return 0.0
+
+        # Essay calibration: do not auto-promote essays to full marks from
+        # merely good similarity. Paper II should keep separation between
         # partial, good, and excellent answers.
-        high_threshold = 0.78 if max_marks <= 2 else 0.97
-        low_threshold = 0.20 if max_marks <= 2 else 0.15
+        high_threshold = 0.97
+        low_threshold = 0.15
 
         if ratio >= high_threshold: return 1.0
         if ratio < low_threshold: return 0.0
@@ -2570,6 +2580,62 @@ Return ONLY a valid JSON object mirroring the keys provided.
         ]
         return [concept for concept in concepts if len(concept) >= 4]
 
+    def _concept_terms(self, text: str) -> set:
+        terms = re.findall(r"\w+", str(text or "").lower())
+        return {term for term in terms if len(term) >= 2}
+
+    def _normalize_match_text(self, text: str) -> str:
+        return re.sub(r"\W+", "", str(text or "").lower(), flags=re.UNICODE)
+
+    def _split_short_answer_points(self, text: str) -> List[str]:
+        points = [
+            re.sub(r"\s+", " ", item).strip(" -:\t\r\n")
+            for item in re.split(r"[,;ï¼›.!?\nà¥¤]+", str(text or ""))
+        ]
+        return [point for point in points if len(point) >= 2]
+
+    def _concept_lexical_score(self, student_text: str, concept_text: str) -> float:
+        student_norm = self._normalize_match_text(student_text)
+        concept_norm = self._normalize_match_text(concept_text)
+        if student_norm and concept_norm and (student_norm == concept_norm or concept_norm in student_norm):
+            return 1.0
+
+        concept_terms = self._concept_terms(concept_text)
+        student_terms = self._concept_terms(student_text)
+        if not concept_terms or not student_terms:
+            return 0.0
+        overlap = len(student_terms & concept_terms)
+        expected_hits = max(1, min(len(concept_terms), max(2, int(round(len(concept_terms) * 0.60)))))
+        return min(1.0, overlap / expected_hits)
+
+    def _calculate_short_factual_coverage(self, student_text: str, reference_text: str, max_marks: int) -> Tuple[float, str]:
+        reference_points = self._split_short_answer_points(reference_text)
+        student_points = self._split_short_answer_points(student_text)
+        if not reference_points:
+            reference_points = self._split_reference_concepts(reference_text)
+        if not reference_points:
+            return 0.0, "No short reference points"
+
+        expected_points = min(len(reference_points), max(1, int(max_marks)))
+        matched_reference_indexes = set()
+
+        for student_point in student_points or [student_text]:
+            best_idx = None
+            best_score = 0.0
+            for idx, reference_point in enumerate(reference_points):
+                if idx in matched_reference_indexes:
+                    continue
+                score = self._concept_lexical_score(student_point, reference_point)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+            if best_idx is not None and best_score >= 0.75:
+                matched_reference_indexes.add(best_idx)
+
+        hits = min(len(matched_reference_indexes), expected_points)
+        ratio = hits / max(1, expected_points)
+        return ratio, f"{hits}/{expected_points} factual points matched"
+
     def _calculate_coverage_score(self, student_text: str, reference_text: str, max_marks: int, student_emb=None):
         """
         Measures how many key concepts from the reference the student covered.
@@ -2591,6 +2657,9 @@ Return ONLY a valid JSON object mirroring the keys provided.
         if not sentences:
             return 0.0, "No reference sentences"
 
+        if max_marks <= 2:
+            return self._calculate_short_factual_coverage(student_text, reference_text, max_marks)
+
         s_emb = student_emb if student_emb is not None else _embedding_cache.get(student_text)
         if s_emb is None:
             with ml_semaphore:
@@ -2603,12 +2672,20 @@ Return ONLY a valid JSON object mirroring the keys provided.
         sentence_embs = torch.stack([_embedding_cache[s] for s in sentences])
         sims = _cosine_util().cos_sim(s_emb, sentence_embs)[0]
 
-        # Threshold: how similar must a reference point be to count as covered.
-        # Paper II references are usually semicolon-separated covering points.
-        # Keep this stricter than topical similarity so merely writing around
-        # the same topic does not count as explaining every point.
-        threshold = 0.28 if max_marks <= 2 else 0.46
-        hits = int((sims >= threshold).sum().item())
+        # A concept is credited when either the multilingual embedding sees the
+        # same idea or enough key terms survive Sinhala/OCR variation.
+        semantic_threshold = 0.40
+        lexical_threshold = 0.45
+        covered_concepts = []
+        missing_concepts = []
+        for idx, sentence in enumerate(sentences):
+            semantic_sim = float(sims[idx].item())
+            lexical_score = self._concept_lexical_score(student_text, sentence)
+            if semantic_sim >= semantic_threshold or lexical_score >= lexical_threshold:
+                covered_concepts.append(sentence)
+            else:
+                missing_concepts.append(sentence)
+        hits = len(covered_concepts)
 
         # Cap the denominator to a fair expected concept count for this question.
         # A 4-mark structured essay should normally need about 4 distinct points
@@ -2640,15 +2717,21 @@ Return ONLY a valid JSON object mirroring the keys provided.
         ]
         marker_hits = sum(1 for marker in explanation_markers if marker in student_text)
 
-        if words_per_expected_concept >= 10 and marker_hits >= 2:
+        sentence_count = len([s for s in re.split(r"[.!?\n]+", str(student_text or "")) if len(s.strip()) >= 8])
+        list_separators = str(student_text or "").count(",") + str(student_text or "").count(";")
+        looks_list_like = list_separators >= max(2, sentence_count + 1) or sentence_count <= 1
+
+        if words_per_expected_concept >= 14 and sentence_count >= 3 and marker_hits >= 1:
             return 1.0
-        if words_per_expected_concept >= 7 and marker_hits >= 1:
-            return 0.90
+        if words_per_expected_concept >= 11 and sentence_count >= 2 and marker_hits >= 1:
+            return 0.90 if not looks_list_like else 0.82
+        if words_per_expected_concept >= 8 and sentence_count >= 2:
+            return 0.78 if not looks_list_like else 0.68
         if words_per_expected_concept >= 5:
-            return 0.78
+            return 0.62 if not looks_list_like else 0.55
         if coverage >= 0.75:
-            return 0.70
-        return 0.60
+            return 0.55
+        return 0.45
 
 
     # ----------------------------------------------------------
@@ -2728,23 +2811,21 @@ Return ONLY a valid JSON object mirroring the keys provided.
         if max_marks <= 2:
             return 1.0
 
-        if coverage >= 0.95:
-            return 1.0
-
         student_words = len(re.findall(r'\w+', student_text))
 
-        # Expected words could scale with max_marks: ~2 words per mark (concise bullet points)
-        expected_min_words = max_marks * 2
+        # A 4-mark essay can be concise, but it should still contain
+        # explanatory sentences rather than bare comma-separated terms.
+        expected_min_words = max(28, max_marks * 8)
 
         if student_words >= expected_min_words:
             return 1.0
 
         if student_words < expected_min_words * 0.3:
-            return 0.80
+            return 0.65
         elif student_words < expected_min_words * 0.5:
-            return 0.90
+            return 0.78
         elif student_words < expected_min_words * 0.7:
-            return 0.95
+            return 0.90
 
         # Reasonable length: no penalty
         return 1.0
@@ -2840,10 +2921,20 @@ Return ONLY a valid JSON object mirroring the keys provided.
         # Paper I — Short Factual Answers (max_marks <= 2)
         # ------------------------------------------------------------------
         if max_marks <= 2:
-            # Consistent blend for ALL short answers — no gold-standard shortcut.
-            # Semantic (80%): dominates because XLM-R structural matching is robust
-            # Relevance (20%): tied to keyword matching which is noisy in Sinhala
-            combined = (0.80 * semantic) + (0.20 * relevance)
+            # Short factual answers still need reference-point coverage. Sinhala
+            # embeddings can treat nearby historical terms as too similar, so a
+            # wrong constitution/person/date should not become full credit from
+            # topical similarity alone.
+            coverage, coverage_debug = self._calculate_coverage_score(
+                student_text, reference_text, max_marks, student_emb
+            )
+            logger.info(f"[SHORT_COVERAGE] {coverage_debug} -> coverage_ratio={coverage:.3f}")
+            if coverage <= 0.0:
+                return 0.0
+            if coverage >= 1.0:
+                combined = 0.90 + (0.10 * min(1.0, max(semantic, relevance)))
+            else:
+                combined = min(0.60, (0.85 * coverage) + (0.10 * relevance) + (0.05 * semantic))
             return float(combined)
 
         # ------------------------------------------------------------------
@@ -2863,7 +2954,24 @@ Return ONLY a valid JSON object mirroring the keys provided.
         # Paper II should reward covered marking points and explanatory depth.
         # Semantic similarity is only topicality; it must not overpower missing
         # covering points from the confirmed schema.
-        score = (0.20 * semantic) + (0.55 * coverage) + (0.15 * relevance) + (0.10 * explanation)
+        score = (0.10 * semantic) + (0.55 * coverage) + (0.10 * relevance) + (0.25 * explanation)
+
+        # A well-explained essay that clearly covers most schema concepts should
+        # not be dragged down by OCR/noisy embedding misses. These floors are
+        # conservative and still depend on coverage, relevance, and explanation.
+        if coverage >= 0.90 and relevance >= 0.55 and explanation >= 0.88:
+            score = max(score, 0.90)
+        elif coverage >= 0.65 and relevance >= 0.50 and explanation >= 0.75:
+            score = max(score, 0.75)
+        elif coverage >= 0.45 and relevance >= 0.60 and explanation >= 0.75:
+            score = max(score, 0.625)
+
+        if coverage < 0.90 or explanation < 0.88:
+            score = min(score, 0.875)
+        if coverage < 0.75 or explanation < 0.70:
+            score = min(score, 0.75)
+        if coverage < 0.50:
+            score = min(score, 0.625)
 
         # Apply depth penalty for very short essays
         depth_mult = self._calculate_depth_penalty(student_text, reference_text, max_marks, coverage)
@@ -2941,20 +3049,72 @@ Return ONLY a valid JSON object mirroring the keys provided.
         display = item.get("display_number", "")
         final_marks = item.get("final_marks", item.get("awarded_marks", 0))
         max_marks = item.get("max_marks", 1)
-        band = self._score_band_label(item)
+        max_marks_dec = Decimal(str(max_marks or 1))
+        if max_marks_dec <= 0:
+            max_marks_dec = Decimal("1")
+        final_marks_dec = Decimal(str(final_marks or 0))
+        ratio = float(final_marks_dec / max_marks_dec)
 
-        if band == "excellent":
-            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුර ඉතා හොඳ මට්ටමේ ඇත. ප්‍රධාන කරුණු බොහෝ දුරට නිවැරදිව ආවරණය කර ඇත."
-        elif band == "good":
-            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුර බොහෝ දුරට නිවැරදිය. තවත් නිශ්චිත කරුණු කිහිපයක් එකතු කළහොත් පිළිතුර වඩා සම්පූර්ණ වේ."
-        elif band == "partial":
-            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුර අර්ධ වශයෙන් නිවැරදිය. ප්‍රශ්නයට අදාළ ප්‍රධාන කරුණු තවදුරටත් පැහැදිලි කළ යුතුය."
-        elif band == "limited":
-            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුර සීමිත මට්ටමේ ඇත. අදාළ කරුණු පැහැදිලිව සහ ප්‍රමාණවත් ලෙස දැක්වීම අවශ්‍ය වේ."
+        student_text = str(item.get("student_text") or "")
+        reference_text = str(item.get("reference_text") or "")
+        if max_marks_dec <= Decimal("2"):
+            concepts = self._split_short_answer_points(reference_text)
+            match_threshold = 0.75
         else:
-            body = "ලබා දී ඇති ලකුණු අනුව පිළිතුරට ලකුණු ලබා දීමට ප්‍රමාණවත් අදාළ කරුණු හමු නොවේ."
+            concepts = self._split_reference_concepts(reference_text)
+            match_threshold = 0.45
 
-        return f"**ප්‍රශ්නය {display}** {body} ({final_marks}/{max_marks})"
+        matched_concepts: List[str] = []
+        missing_concepts: List[str] = []
+        for concept in concepts[:8]:
+            if self._concept_lexical_score(student_text, concept) >= match_threshold:
+                matched_concepts.append(concept)
+            else:
+                missing_concepts.append(concept)
+
+        if matched_concepts:
+            correct_text = "; ".join(matched_concepts[:3])
+        elif ratio > 0:
+            correct_text = "අදාළ කරුණු කිහිපයක් හඳුනාගෙන තිබුණත් ඒවා පැහැදිලිව සනාථ වී නොමැත"
+        else:
+            correct_text = "ලකුණු ලබා දීමට ප්‍රමාණවත් නිවැරදි කරුණු පැහැදිලිව හමු නොවුණි"
+
+        if missing_concepts:
+            missing_text = "; ".join(missing_concepts[:3])
+        elif concepts:
+            missing_text = "ප්‍රධාන ආවරණ කරුණු බොහෝ දුරට ඇතුළත් වේ"
+        else:
+            missing_text = "marking schema හි පැහැදිලි reference covering points නොමැති නිසා ප්‍රධාන අඩුපාඩු නම් කිරීමට නොහැක"
+
+        if ratio <= 0:
+            reason = "පිළිතුරෙන් marking schema හි අවශ්‍ය ප්‍රධාන කරුණු සනාථ නොවූ නිසා ලකුණු ලබා දිය නොහැක."
+        elif max_marks_dec <= Decimal("2") and ratio < 1:
+            reason = "කෙටි පිළිතුරේ අවශ්‍ය නිශ්චිත කරුණු/නම් සියල්ල නිවැරදිව නොතිබූ නිසා ලකුණු අඩුවිය."
+        elif max_marks_dec > Decimal("2") and ratio < 0.5:
+            reason = "අදාළ කරුණු කිහිපයක් පමණක් හඳුනාගෙන තිබුණත්, ප්‍රමාණවත් විස්තර සහ ප්‍රධාන ආවරණ කරුණු අඩුය."
+        elif max_marks_dec > Decimal("2") and ratio < 0.875:
+            reason = "ප්‍රධාන කරුණු කිහිපයක් නිවැරදි වුවත්, essay පිළිතුරට අවශ්‍ය සවිස්තරාත්මක පැහැදිලි කිරීම හෝ ආවරණය තවදුරටත් අඩුය."
+        elif ratio < 1:
+            reason = "පිළිතුර ශක්තිමත් වුවත්, සුළු කරුණක් හෝ පැහැදිලි කිරීමක් අඩු වූ නිසා සම්පූර්ණ ලකුණු නොලැබුණි."
+        else:
+            reason = "අදාළ ප්‍රධාන කරුණු නිවැරදිව සහ ප්‍රමාණවත් ලෙස ඉදිරිපත් කර ඇත."
+
+        return (
+            f"**ප්‍රශ්නය {display}**\n"
+            f"**නිවැරදිව සඳහන් කළ කරුණු:** {correct_text}\n"
+            f"**අඩු වූ/නොපැහැදිලි කරුණු:** {missing_text}\n"
+            f"**ලකුණු අඩුවීමට හේතුව:** {reason} ({final_marks}/{max_marks})"
+        )
+
+    def _is_generic_feedback(self, feedback: str) -> bool:
+        text = str(feedback or "").strip().lower()
+        generic_markers = [
+            "පිළිතුර අගය කරන ලදී",
+            "answer evaluated",
+            "evaluated answer",
+            "feedback generated",
+        ]
+        return any(marker in text for marker in generic_markers)
 
     def _feedback_contradicts_score(self, feedback: str, item: Dict[str, Any]) -> bool:
         if not feedback:
@@ -3022,13 +3182,17 @@ Your role is to write brief, constructive feedback in Sinhala.
 The marks are already finalized. DO NOT suggest marks.
 
 FEEDBACK REQUIREMENTS:
-1. Explain **WHY** it is correct, partially correct, or wrong based on the Reference Context.
-2. For partial answers, clearly state which missing points should have been included.
-3. Keep feedback concise (2-3 sentences).
-4. Use Markdown formatting: **bold** for emphasis, bullet points if needed.
-5. Language: Simple, professional written Sinhala.
-6. The final awarded mark is already fixed. Your feedback MUST match that mark.
-7. If the final mark is 0, do not say the answer is correct. If the final mark is high, do not say the answer is completely wrong.
+1. Evaluate against the Reference Covering Points, not only general topic similarity.
+2. State concepts the student correctly included.
+3. State important concepts that are missing, weak, or only named without explanation.
+4. Do not say a concept is missing if it is explicitly present in the Student Answer.
+5. Keep feedback concise but explainable: 3 short Sinhala lines are preferred.
+6. Use this structure inside the feedback string:
+   **නිවැරදිව සඳහන් කළ කරුණු:** ...
+   **අඩු වූ/නොපැහැදිලි කරුණු:** ...
+   **ලකුණු අඩුවීමට හේතුව:** ...
+7. The final awarded mark is already fixed. Your feedback MUST match that mark.
+8. If the final mark is 0, do not say the answer is correct. If the final mark is high, do not say the answer is completely wrong.
 
 OUTPUT FORMAT (Pure JSON only):
 {
@@ -3051,8 +3215,10 @@ Questions to evaluate:
                 chunk_prompt += f"Max Marks: {item['max_marks']}\n"
                 chunk_prompt += f"Final Awarded Marks: {item.get('final_marks', item['awarded_marks'])}/{item['max_marks']}\n"
                 chunk_prompt += f"Score Band: {self._score_band_label(item)}\n"
-                chunk_prompt += f"Student Answer: {str(item['student_text'])[:500]}\n"
-                chunk_prompt += f"Reference Context: {str(item['reference_text'])[:600]}\n"
+                reference_concepts = self._split_reference_concepts(str(item.get("reference_text") or ""))
+                chunk_prompt += f"Student Answer: {str(item['student_text'])[:700]}\n"
+                chunk_prompt += f"Reference Covering Points: {json.dumps(reference_concepts[:8], ensure_ascii=False)}\n"
+                chunk_prompt += f"Reference Context: {str(item['reference_text'])[:800]}\n"
 
             try:
                 sent_keys = [it["key"] for it in chunk]
