@@ -212,7 +212,7 @@ class AnswerabilityService:
         # Cap at 1.0
         relevance_score = min(relevance_score, 1.0)
         
-        logger.debug(f"Relevance breakdown - Terms matched: {matched_terms}, "
+        logger.info(f"Relevance breakdown - Terms matched: {matched_terms}, "
                     f"Term overlap: {term_overlap_ratio:.3f}, "
                     f"Chunk similarity: {avg_chunk_similarity:.3f}, "
                     f"Phrase matches: {phrase_score:.3f} → Final: {relevance_score:.3f}")

@@ -92,7 +92,7 @@ def build_summary_prompt(
     
     query_part = f"ප්‍රශ්නය / ඉල්ලීම: {query}\n\n" if query else ""
 
-    # Add complexity-based guidance with structure focus
+    # complexity-based guidance with structure focus
     complexity_guidance = {
         "basic": """
 📌 **සාරාංශ ව්‍යුහය:**
