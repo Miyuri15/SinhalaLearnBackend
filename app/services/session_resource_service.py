@@ -38,4 +38,8 @@ class SessionResourceService:
     def detach_resources_by_label(self, session_id: UUID, label: str) -> bool:
         """Remove all resource links with a specific label from a session. Returns True if found and removed."""
         return self.repository.detach_resources_by_label(session_id, label)
+    
+    def get_resource_ids_by_session(self, session_id: UUID) -> List[UUID]:
+        """Helper to get just the list of resource IDs for a session."""
+        return self.repository.get_resource_ids_by_session(session_id)
 
