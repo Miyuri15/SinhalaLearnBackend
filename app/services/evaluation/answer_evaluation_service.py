@@ -280,16 +280,32 @@ class AnswerEvaluationService:
         chat_session_id = eval_session.session_id if eval_session else None
         
         paper_configs = self.repository.db.query(PaperConfig).filter(
+            PaperConfig.is_confirmed.is_(True),
             (PaperConfig.evaluation_session_id == result.answer_document.evaluation_session_id) |
             (PaperConfig.chat_session_id == chat_session_id)
         ).all()
         # NORMALIZE keys to paper_i, paper_ii for robust matching
         selection_map = {}
+        config_info_by_part = {}
         for c in paper_configs:
+            logger.info(
+                "[CONFIRMED_PAPER_CONFIG] session=%s source=%s part=%s total_marks=%s total_main_questions=%s selection_rules=%s",
+                result.answer_document.evaluation_session_id,
+                "evaluation_session" if c.evaluation_session_id == result.answer_document.evaluation_session_id else "chat_session",
+                c.paper_part,
+                c.total_marks,
+                c.total_main_questions,
+                c.selection_rules,
+            )
+            norm_key = c.paper_part.lower().replace(" ", "_").replace("paper_", "paper_") if c.paper_part else ""
+            if "i" in norm_key and "ii" not in norm_key: norm_key = "paper_i"
+            elif "ii" in norm_key: norm_key = "paper_ii"
+            if norm_key:
+                config_info_by_part[norm_key] = {
+                    "total_marks": float(c.total_marks) if c.total_marks is not None else None,
+                    "total_main_questions": c.total_main_questions,
+                }
             if c.selection_rules:
-                norm_key = c.paper_part.lower().replace(" ", "_").replace("paper_", "paper_")
-                if "i" in norm_key and "ii" not in norm_key: norm_key = "paper_i"
-                elif "ii" in norm_key: norm_key = "paper_ii"
                 selection_map[norm_key] = c.selection_rules
 
         # Calculate summary with leaf-node focus to prevent double-display
@@ -349,7 +365,12 @@ class AnswerEvaluationService:
 
                 # Track for Total Available logic (Selection Aware)
                 if mq_id not in mq_data:
-                    mq_data[mq_id] = {"awarded": 0, "max": 0, "attempted": 0}
+                    mq_data[mq_id] = {
+                        "awarded": 0,
+                        "max": 0,
+                        "attempted": 0,
+                        "label": main_q.question_number if main_q else label,
+                    }
                 mq_data[mq_id]["awarded"] += awarded
                 mq_data[mq_id]["max"] += max_m
                 if awarded > 0:
@@ -371,6 +392,56 @@ class AnswerEvaluationService:
             required_count = rules.get('count') or rules.get('total') or rules.get('choose_any')
 
             selected_mq_ids = set(mq_data.keys())  # default: all selected
+            selected_entries = list(mq_data.items())
+            part_full_max = sum(v["max"] for v in mq_data.values())
+            configured_part_total = (config_info_by_part.get(norm_part) or {}).get("total_marks")
+            known_config_total = sum(
+                info["total_marks"]
+                for info in config_info_by_part.values()
+                if info.get("total_marks") is not None
+            )
+            session_total_marks = getattr(eval_session, "total_marks", None)
+            overall_total = float(session_total_marks or 0) if session_total_marks else 0
+            inferred_part_total = None
+            if configured_part_total and configured_part_total > 0:
+                inferred_part_total = configured_part_total
+            elif overall_total > known_config_total and norm_part in config_info_by_part:
+                missing_parts = [
+                    part_key
+                    for part_key, info in config_info_by_part.items()
+                    if info.get("total_marks") is None
+                ]
+                if len(missing_parts) == 1 and missing_parts[0] == norm_part:
+                    inferred_part_total = overall_total - known_config_total
+
+            if (not is_selection_mode) and inferred_part_total and 0 < inferred_part_total < part_full_max:
+                main_max_values = [v["max"] for v in mq_data.values() if v["max"] > 0]
+                typical_main_max = max(set(main_max_values), key=main_max_values.count) if main_max_values else 0
+                if typical_main_max and inferred_part_total % typical_main_max == 0:
+                    inferred_count = int(inferred_part_total / typical_main_max)
+                    if 0 < inferred_count < len(mq_data):
+                        mode = "any"
+                        required_count = inferred_count
+                        is_selection_mode = True
+                        logger.info(
+                            "[INFERRED_SELECTION_RULES] part=%s inferred_total=%s typical_main_max=%s mode=any count=%s",
+                            norm_part,
+                            inferred_part_total,
+                            typical_main_max,
+                            inferred_count,
+                        )
+            elif (not is_selection_mode) and norm_part != "paper_i" and norm_part in config_info_by_part:
+                attempted_count = sum(1 for v in mq_data.values() if v.get("attempted", 0) > 0)
+                has_unattempted = any(v.get("attempted", 0) <= 0 for v in mq_data.values())
+                if attempted_count > 0 and has_unattempted:
+                    mode = "attempted_only"
+                    required_count = attempted_count
+                    is_selection_mode = True
+                    logger.info(
+                        "[INFERRED_SELECTION_RULES] part=%s mode=attempted_only count=%s reason=missing_config_selection",
+                        norm_part,
+                        attempted_count,
+                    )
 
             if is_selection_mode and required_count and len(mq_data) > int(required_count):
                 # SYNC: Sort by (awarded DESC, attempted DESC) to match GradingService
@@ -390,9 +461,33 @@ class AnswerEvaluationService:
             total_max_allowed += part_max_allowed
             total_awarded += part_awarded
 
+            logger.info(
+                "[RESULT_SELECTION] part=%s mode=%s required_count=%s main_questions=%s selected=%s part_awarded=%s part_max=%s",
+                norm_part,
+                mode,
+                required_count,
+                len(mq_data),
+                [
+                    {
+                        "label": data.get("label"),
+                        "awarded": round(data.get("awarded", 0), 2),
+                        "max": round(data.get("max", 0), 2),
+                        "attempted": data.get("attempted", 0),
+                    }
+                    for _, data in selected_entries
+                ],
+                round(part_awarded, 2),
+                round(part_max_allowed, 2),
+            )
+
             # Tag each score entry with is_selected so the frontend can highlight them
             for entry in marks_summary[clean_part]:
                 entry["is_selected"] = entry.get("_mq_id") in selected_mq_ids
+                entry["counts_toward_total"] = entry["is_selected"]
+                entry["awarded_for_total"] = entry["awarded"] if entry["counts_toward_total"] else 0
+                entry["max_for_total"] = entry["max"] if entry["counts_toward_total"] else 0
+                entry["part_total_awarded"] = round(part_awarded, 2)
+                entry["part_total_max"] = round(part_max_allowed, 2)
 
 
         
@@ -400,6 +495,7 @@ class AnswerEvaluationService:
         # No, result.total_score is already calculated best-of-N in GradingService.
         # We just need the UI to show the correct /Total.
         
+        summary_total_max_allowed = total_max_allowed
         logger.debug(f"Generated marks summary. Total Available: {total_max_allowed}")
 
 
@@ -438,6 +534,15 @@ class AnswerEvaluationService:
             chat_session_id=chat_session_id,
             selection_map=selection_map,
         )
+        if summary_total_max_allowed and (
+            not total_max_allowed or summary_total_max_allowed < total_max_allowed
+        ):
+            logger.info(
+                "[TOTAL_MAX_SOURCE] source=selection_aware_summary total=%s resolved_total=%s",
+                summary_total_max_allowed,
+                total_max_allowed,
+            )
+            total_max_allowed = round(summary_total_max_allowed, 2)
         percentage_score = None
         if total_max_allowed and total_max_allowed > 0:
             percentage_score = round((float(result.total_score or 0) / float(total_max_allowed)) * 100, 2)
@@ -515,13 +620,53 @@ class AnswerEvaluationService:
         chat_session_id: Optional[UUID],
         selection_map: Dict[str, Dict],
     ) -> float:
-        configured_total = self._resolve_total_max_from_paper_config(evaluation_session_id, chat_session_id)
-        if configured_total is not None and configured_total > 0:
-            return configured_total
-
+        config_totals_by_part = self._resolve_paper_config_totals_by_part(evaluation_session_id, chat_session_id)
+        configured_total = round(sum(config_totals_by_part.values()), 2) if config_totals_by_part else None
         schema_total = self._resolve_total_max_from_marking_schema(evaluation_session_id, selection_map)
-        if schema_total is not None and schema_total > 0:
-            return schema_total
+        schema_parts = self._resolve_marking_schema_part_keys(evaluation_session_id)
+
+        if configured_total is not None and configured_total > 0:
+            eval_session = self.repository.db.query(EvaluationSession).filter(EvaluationSession.id == evaluation_session_id).first()
+            session_total_marks = getattr(eval_session, "total_marks", None)
+            overall_total = float(session_total_marks or 0) if session_total_marks else 0
+            if overall_total > configured_total and schema_parts:
+                missing_parts = schema_parts - set(config_totals_by_part)
+                if len(missing_parts) == 1:
+                    missing_part = next(iter(missing_parts))
+                    inferred_total = round(overall_total - configured_total, 2)
+                    if inferred_total > 0:
+                        config_totals_by_part[missing_part] = inferred_total
+                        configured_total = round(sum(config_totals_by_part.values()), 2)
+                        logger.info(
+                            "[INFERRED_PAPER_CONFIG_TOTAL] part=%s inferred_total=%s overall_total=%s known_parts=%s",
+                            missing_part,
+                            inferred_total,
+                            overall_total,
+                            config_totals_by_part,
+                        )
+            if not schema_parts or schema_parts.issubset(set(config_totals_by_part)):
+                logger.info(
+                    "[TOTAL_MAX_SOURCE] source=confirmed_paper_config total=%s parts=%s schema_parts=%s",
+                    configured_total,
+                    config_totals_by_part,
+                    sorted(schema_parts),
+                )
+                return configured_total
+
+        candidates = [
+            value for value in (schema_total, configured_total)
+            if value is not None and value > 0
+        ]
+        if candidates:
+            logger.info(
+                "[TOTAL_MAX_SOURCE] source=%s total=%s configured_total=%s schema_total=%s selection_map=%s",
+                "confirmed_marking_schema" if candidates[0] == schema_total else "confirmed_paper_config",
+                candidates[0],
+                configured_total,
+                schema_total,
+                selection_map,
+            )
+            return candidates[0]
 
         return 0.0
 
@@ -530,7 +675,18 @@ class AnswerEvaluationService:
         evaluation_session_id: UUID,
         chat_session_id: Optional[UUID],
     ) -> Optional[float]:
+        by_part = self._resolve_paper_config_totals_by_part(evaluation_session_id, chat_session_id)
+        if not by_part:
+            return None
+        return round(sum(by_part.values()), 2)
+
+    def _resolve_paper_config_totals_by_part(
+        self,
+        evaluation_session_id: UUID,
+        chat_session_id: Optional[UUID],
+    ) -> Dict[str, float]:
         configs = self.repository.db.query(PaperConfig).filter(
+            PaperConfig.is_confirmed.is_(True),
             (PaperConfig.evaluation_session_id == evaluation_session_id) |
             (PaperConfig.chat_session_id == chat_session_id)
         ).all()
@@ -548,8 +704,19 @@ class AnswerEvaluationService:
                 by_part[part_key] = cfg_total
 
         if not by_part:
-            return None
-        return round(sum(by_part.values()), 2)
+            return {}
+        return by_part
+
+    def _resolve_marking_schema_part_keys(self, evaluation_session_id: UUID) -> set[str]:
+        schema = self.marking_schema_repository.get_marking_schema_by_session(evaluation_session_id)
+        if not schema:
+            return set()
+        items = self.marking_schema_repository.get_marking_schema_items(schema.id)
+        return {
+            self._normalize_part_key(item.part_name)
+            for item in items
+            if item.part_name
+        }
 
     def _resolve_total_max_from_marking_schema(
         self,

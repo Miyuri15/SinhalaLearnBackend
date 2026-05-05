@@ -270,11 +270,19 @@ def _repair_overall_total_leak(cleaned_result: dict[str, dict]) -> None:
             continue
 
         question_count = len(questions)
-        if repaired_total % question_count != 0:
+        is_common_paper_i_overall_leak = (
+            str(paper_key) == "Paper_I"
+            and total_marks == 100
+            and 0 < repaired_total < total_marks
+        )
+        if not is_common_paper_i_overall_leak and repaired_total % question_count != 0:
             continue
 
         config = paper.setdefault("config", {})
         config["total_marks"] = repaired_total
+        suggested_weightage = _coerce_positive_int(config.get("suggested_weightage"))
+        if suggested_weightage is None or suggested_weightage == total_marks:
+            config["suggested_weightage"] = repaired_total
         logger.warning(
             "Repaired %s total_marks from overall total %s to section total %s using other paper totals=%s.",
             paper_key,
@@ -891,6 +899,7 @@ Analyze the text to determine how the paper should be graded.
    - DO NOT assume Paper I is always MCQ. It can contain structured questions too.
 2. **Total Marks:** 
    - Look for "මුළු ලකුණු" (Total Marks) for each section.
+   - Do NOT copy the full exam total into Paper I. If the paper total is 100 and Paper II is 60, Paper I total_marks must be 40.
    - For Paper I: If MCQs, usually 1 mark each. If structured, look for explicit marks.
    - For Paper II: Look for "Total Marks" or sum the sub-question marks.
 3. **Selection Rules:** Read instructions (e.g., "Answer 3 from 5").

@@ -2,6 +2,7 @@ import sys
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 from app.components.document_processing.services import classifier_service
 
@@ -351,6 +352,297 @@ def test_exam_normalization_repairs_overall_total_leaked_into_paper_i():
         for question in result["Paper_I"]["questions"].values()
     )
     assert result["Paper_II"]["config"]["total_marks"] == 60
+
+
+def test_exam_normalization_repairs_common_paper_i_total_even_when_question_count_is_incomplete():
+    result = classifier_service._normalize_extracted_exam_result(
+        {
+            "Paper_I": {
+                "config": {
+                    "total_marks": 100,
+                    "suggested_weightage": 100,
+                    "total_questions_available": 9,
+                    "selection_rules": {"mode": "all"},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": None,
+                    }
+                    for index in range(1, 10)
+                },
+            },
+            "Paper_II": {
+                "config": {
+                    "total_marks": 60,
+                    "total_questions_available": 8,
+                    "selection_rules": {"mode": "any", "count": 5},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": None,
+                        "sub_questions": {
+                            "a": {"text": "Sub A", "marks": 4},
+                        },
+                    }
+                    for index in range(1, 9)
+                },
+            },
+        }
+    )
+
+    assert result["Paper_I"]["config"]["total_marks"] == 40
+    assert result["Paper_I"]["config"]["suggested_weightage"] == 40
+    assert result["Paper_II"]["config"]["total_marks"] == 60
+
+
+def test_grading_resolves_max_marks_from_confirmed_override():
+    GradingService = _load_grading_service_class()
+    service = GradingService(MagicMock())
+    question = SimpleNamespace(
+        id="q-1",
+        question_text="Extracted question",
+        max_marks=2,
+        part_name="Paper_I",
+    )
+
+    assert service._resolve_max_marks(question, {"q-1": 1}) == 1
+
+
+def test_grading_distributes_confirmed_paper_config_total_across_leaf_questions():
+    GradingService = _load_grading_service_class()
+    from app.shared.models.evaluation_session import MarkingSchema, MarkingSchemaItem, PaperConfig
+    from app.shared.models.question_papers import Question
+
+    eval_session_id = uuid4()
+    chat_session_id = uuid4()
+    questions = [
+        Question(id=uuid4(), question_number=str(index), part_name="Paper_I", max_marks=2)
+        for index in range(1, 41)
+    ]
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return None if self.model is MarkingSchema else None
+
+        def all(self):
+            if self.model is MarkingSchemaItem:
+                return []
+            if self.model is PaperConfig:
+                return [
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_I",
+                        total_marks=40,
+                        is_confirmed=True,
+                    )
+                ]
+            return []
+
+    db = MagicMock()
+    db.query.side_effect = lambda model: FakeQuery(model)
+    service = GradingService(db)
+
+    overrides = service._load_confirmed_mark_overrides(eval_session_id, chat_session_id, questions)
+
+    assert len(overrides) == 40
+    assert set(overrides.values()) == {1}
+
+
+def test_confirmed_paper_config_corrects_stale_confirmed_schema_marks():
+    GradingService = _load_grading_service_class()
+    from app.shared.models.evaluation_session import MarkingSchema, MarkingSchemaItem, PaperConfig
+    from app.shared.models.question_papers import Question
+
+    eval_session_id = uuid4()
+    chat_session_id = uuid4()
+    questions = [
+        Question(id=uuid4(), question_number=str(index), part_name="Paper_I", max_marks=2)
+        for index in range(1, 41)
+    ]
+    schema = SimpleNamespace(id=uuid4(), evaluation_session_id=eval_session_id, is_confirmed=True)
+    stale_items = [
+        SimpleNamespace(question_id=question.id, max_marks=2)
+        for question in questions
+    ]
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return schema if self.model is MarkingSchema else None
+
+        def all(self):
+            if self.model is MarkingSchemaItem:
+                return stale_items
+            if self.model is PaperConfig:
+                return [
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_I",
+                        total_marks=40,
+                        is_confirmed=True,
+                    )
+                ]
+            return []
+
+    db = MagicMock()
+    db.query.side_effect = lambda model: FakeQuery(model)
+    service = GradingService(db)
+
+    overrides = service._load_confirmed_mark_overrides(eval_session_id, chat_session_id, questions)
+
+    assert len(overrides) == 40
+    assert set(overrides.values()) == {1}
+
+
+def test_paper_ii_scoring_weights_covered_points_over_topic_similarity():
+    GradingService = _load_grading_service_class()
+    service = GradingService(MagicMock())
+    service._semantic_similarity = MagicMock(return_value=1.0)
+    service._calculate_relevance_score = MagicMock(return_value=1.0)
+    service._calculate_coverage_score = MagicMock(return_value=(0.25, "1/4 concepts covered"))
+    service._calculate_explanation_quality = MagicMock(return_value=0.70)
+    service._calculate_depth_penalty = MagicMock(return_value=1.0)
+    service._calculate_formal_language_penalty = MagicMock(return_value=1.0)
+
+    score = service._calculate_system_score(
+        student_text="Topically related answer with only one covering point.",
+        reference_text="point one; point two; point three; point four",
+        weights={"semantic": 0.4, "coverage": 0.4, "relevance": 0.2},
+        max_marks=4,
+    )
+
+    assert score < 0.60
+
+
+def test_reference_concept_split_uses_schema_semicolon_points():
+    GradingService = _load_grading_service_class()
+    service = GradingService(MagicMock())
+
+    concepts = service._split_reference_concepts(
+        "දේශපාලන ස්ථාවරත්වය; ස්වාභාවික සම්පත් බහුල වීම; යටත්විජිත වෙළඳපොළ"
+    )
+
+    assert len(concepts) == 3
+
+
+def test_result_total_prefers_complete_confirmed_config_over_available_schema_total():
+    from app.services.evaluation.answer_evaluation_service import AnswerEvaluationService
+    from app.shared.models.evaluation_session import PaperConfig
+
+    eval_session_id = uuid4()
+    chat_session_id = uuid4()
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            if self.model is PaperConfig:
+                return [
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_I",
+                        total_marks=40,
+                    ),
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_II",
+                        total_marks=60,
+                    ),
+                ]
+            return []
+
+    db = MagicMock()
+    db.query.side_effect = lambda model: FakeQuery(model)
+    service = AnswerEvaluationService(db)
+    service.marking_schema_repository.get_marking_schema_by_session.return_value = SimpleNamespace(id=uuid4())
+    service.marking_schema_repository.get_marking_schema_items.return_value = [
+        SimpleNamespace(part_name="Paper_I", question_number=str(index), max_marks=2)
+        for index in range(1, 21)
+    ] + [
+        SimpleNamespace(part_name="Paper_II", question_number=f"{main}(1)", max_marks=4)
+        for main in range(1, 9)
+    ] + [
+        SimpleNamespace(part_name="Paper_II", question_number=f"{main}(2)", max_marks=4)
+        for main in range(1, 9)
+    ] + [
+        SimpleNamespace(part_name="Paper_II", question_number=f"{main}(3)", max_marks=4)
+        for main in range(1, 9)
+    ]
+
+    total = service._resolve_total_max(eval_session_id, chat_session_id, selection_map={})
+
+    assert total == 100
+
+
+def test_result_schema_total_applies_choose_any_when_no_complete_config():
+    from app.services.evaluation.answer_evaluation_service import AnswerEvaluationService
+    from app.shared.models.evaluation_session import PaperConfig
+
+    eval_session_id = uuid4()
+    chat_session_id = uuid4()
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            if self.model is PaperConfig:
+                return [
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_I",
+                        total_marks=40,
+                    )
+                ]
+            return []
+
+    db = MagicMock()
+    db.query.side_effect = lambda model: FakeQuery(model)
+    service = AnswerEvaluationService(db)
+    service.marking_schema_repository.get_marking_schema_by_session.return_value = SimpleNamespace(id=uuid4())
+    service.marking_schema_repository.get_marking_schema_items.return_value = [
+        SimpleNamespace(part_name="Paper_I", question_number=str(index), max_marks=2)
+        for index in range(1, 21)
+    ] + [
+        SimpleNamespace(part_name="Paper_II", question_number=f"{main}({sub})", max_marks=4)
+        for main in range(1, 9)
+        for sub in range(1, 4)
+    ]
+
+    total = service._resolve_total_max(
+        eval_session_id,
+        chat_session_id,
+        selection_map={"paper_ii": {"mode": "any", "count": 5}},
+    )
+
+    assert total == 100
 
 
 def test_reference_extraction_respects_request_budget(monkeypatch):

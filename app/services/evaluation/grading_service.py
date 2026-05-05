@@ -26,7 +26,7 @@ from app.shared.models.answer_evaluation import (
 )
 from app.shared.models.question_papers import Question, SubQuestion
 from app.shared.models.session_resources import SessionResource
-from app.shared.models.evaluation_session import EvaluationSession, PaperConfig
+from app.shared.models.evaluation_session import EvaluationSession, MarkingSchema, MarkingSchemaItem, PaperConfig
 from app.shared.models.resource_file import ResourceFile
 from app.shared.models.rubrics import Rubric, RubricCriterion
 from app.shared.ai.embeddings import get_xlmr_model, ml_semaphore, ensure_sentences_cached, _embedding_cache
@@ -75,7 +75,12 @@ class GradingService:
     # ----------------------------------------------------------
     # MARK RESOLUTION
     # ----------------------------------------------------------
-    def _resolve_max_marks(self, question):
+    def _resolve_max_marks(self, question, confirmed_marks: Optional[Dict[str, int]] = None):
+        confirmed_marks = confirmed_marks or {}
+        question_id = str(getattr(question, "id", "") or "")
+        if question_id in confirmed_marks:
+            return confirmed_marks[question_id]
+
         parsed_marks = self._extract_marks_from_question_text(
             getattr(question, "question_text", "") or getattr(question, "sub_question_text", "")
         )
@@ -104,6 +109,140 @@ class GradingService:
                 return max(1, int(parent.max_marks) // len(parent.sub_questions))
 
         return 1
+
+    def _normalize_part_key(self, part_name: str) -> str:
+        normalized = str(part_name or "").strip().lower().replace(" ", "_")
+        if re.search(r'(_iv|iv)$', normalized):
+            return "paper_iv"
+        if re.search(r'(_iii|iii)$', normalized):
+            return "paper_iii"
+        if re.search(r'(_ii|ii)$', normalized):
+            return "paper_ii"
+        if re.search(r'(_i|i)$', normalized):
+            return "paper_i"
+        return normalized
+
+    def _iter_leaf_targets(self, questions: List[Question]):
+        def iter_subs(sub_questions):
+            for sub_question in sub_questions or []:
+                children = getattr(sub_question, "children", []) or []
+                if children:
+                    yield from iter_subs(children)
+                else:
+                    yield sub_question
+
+        for question in questions or []:
+            sub_questions = getattr(question, "sub_questions", []) or []
+            if sub_questions:
+                yield from iter_subs(sub_questions)
+            else:
+                yield question
+
+    def _question_roots_from_map(self, question_map: Dict) -> List[Question]:
+        roots: Dict[str, Question] = {}
+        for target in {id(value): value for value in (question_map or {}).values()}.values():
+            if isinstance(target, Question):
+                roots[str(target.id)] = target
+            elif isinstance(target, SubQuestion) and getattr(target, "question", None):
+                roots[str(target.question.id)] = target.question
+        return list(roots.values())
+
+    def _load_confirmed_mark_overrides(
+        self,
+        eval_session_id: UUID,
+        chat_session_id: Optional[UUID],
+        questions: List[Question],
+    ) -> Dict[str, int]:
+        """
+        Build max-mark overrides from confirmed user-facing configuration.
+        Priority:
+        1. Confirmed marking-schema item max_marks, because those are per question.
+        2. Confirmed PaperConfig total_marks distributed across leaf targets in that part.
+        """
+        overrides: Dict[str, int] = {}
+
+        confirmed_schema = (
+            self.db.query(MarkingSchema)
+            .filter(
+                MarkingSchema.evaluation_session_id == eval_session_id,
+                MarkingSchema.is_confirmed.is_(True),
+            )
+            .first()
+        )
+        if confirmed_schema:
+            schema_items = (
+                self.db.query(MarkingSchemaItem)
+                .filter(MarkingSchemaItem.marking_schema_id == confirmed_schema.id)
+                .all()
+            )
+            for item in schema_items:
+                try:
+                    mark = int(item.max_marks) if item.max_marks is not None else None
+                except (TypeError, ValueError):
+                    mark = None
+                if mark and mark > 0 and item.question_id:
+                    overrides[str(item.question_id)] = mark
+
+        config_query = self.db.query(PaperConfig).filter(PaperConfig.is_confirmed.is_(True))
+        if chat_session_id:
+            config_query = config_query.filter(
+                (PaperConfig.evaluation_session_id == eval_session_id)
+                | (PaperConfig.chat_session_id == chat_session_id)
+            )
+        else:
+            config_query = config_query.filter(PaperConfig.evaluation_session_id == eval_session_id)
+
+        confirmed_configs = config_query.all()
+        if not confirmed_configs:
+            return overrides
+
+        configs_by_part: Dict[str, PaperConfig] = {}
+        for config in confirmed_configs:
+            part_key = self._normalize_part_key(config.paper_part)
+            if not part_key:
+                continue
+            existing = configs_by_part.get(part_key)
+            if existing is None or (
+                existing.evaluation_session_id is None and config.evaluation_session_id == eval_session_id
+            ):
+                configs_by_part[part_key] = config
+
+        leaf_targets = list(self._iter_leaf_targets(questions))
+        leaf_targets_by_part: Dict[str, List[Any]] = {}
+        for target in leaf_targets:
+            part_key = self._normalize_part_key(self._resolve_part_name(target))
+            leaf_targets_by_part.setdefault(part_key, []).append(target)
+
+        for part_key, config in configs_by_part.items():
+            try:
+                total_marks = int(config.total_marks) if config.total_marks is not None else None
+            except (TypeError, ValueError):
+                total_marks = None
+            targets = leaf_targets_by_part.get(part_key) or []
+            if not total_marks or total_marks <= 0 or not targets:
+                continue
+            if total_marks % len(targets) != 0:
+                continue
+            per_target_marks = total_marks // len(targets)
+            if per_target_marks <= 0:
+                continue
+            existing_part_marks = [
+                overrides.get(str(getattr(target, "id", "") or ""))
+                for target in targets
+            ]
+            existing_part_marks = [mark for mark in existing_part_marks if mark is not None]
+            should_apply_config_marks = (
+                len(existing_part_marks) != len(targets)
+                or sum(existing_part_marks) != total_marks
+            )
+            if not should_apply_config_marks:
+                continue
+            for target in targets:
+                target_id = str(getattr(target, "id", "") or "")
+                if target_id:
+                    overrides[target_id] = per_target_marks
+
+        return overrides
 
     def _extract_marks_from_question_text(self, text: str) -> Optional[int]:
         patterns = [
@@ -230,6 +369,18 @@ class GradingService:
 
         eval_session = self.db.query(EvaluationSession).filter(EvaluationSession.id == eval_session_id).first()
         rubric_weights = self._get_rubric_weights(eval_session)
+        chat_session_id = eval_session.session_id if eval_session else None
+        confirmed_mark_overrides = self._load_confirmed_mark_overrides(
+            eval_session_id=eval_session_id,
+            chat_session_id=chat_session_id,
+            questions=self._question_roots_from_map(question_map),
+        )
+        if confirmed_mark_overrides:
+            logger.info(
+                "Loaded %s confirmed max-mark override(s) for evaluation session %s.",
+                len(confirmed_mark_overrides),
+                eval_session_id,
+            )
 
         total_questions = len(answer_doc.mapped_answers)
         processed_count = 0
@@ -297,7 +448,7 @@ class GradingService:
             if isinstance(target, Question) and self._has_any_mapped_descendant(target, answer_doc.mapped_answers):
                 continue
 
-            max_marks = self._resolve_max_marks(target)
+            max_marks = self._resolve_max_marks(target, confirmed_mark_overrides)
             # PRIMARY: Gemini-extracted reference points
             # FALLBACK: BM25 retrieval from syllabus / correct_answer gold standard
             reference_text = gemini_ref_map.get(key)
@@ -348,7 +499,7 @@ class GradingService:
             seen_question_ids.add(target_id)
             seen_keys.add(key)
 
-            max_marks = self._resolve_max_marks(target)
+            max_marks = self._resolve_max_marks(target, confirmed_mark_overrides)
             # Use Gemini-extracted ref (primary) with BM25 fallback
             reference_text = gemini_ref_map.get(key) or self._get_reference_context(target, syllabus_text, rubric_text)
 
@@ -458,12 +609,29 @@ class GradingService:
 
         config_service = PaperConfigService(self.db)
         paper_configs = self.db.query(PaperConfig).filter(
+            PaperConfig.is_confirmed.is_(True),
             (PaperConfig.evaluation_session_id == eval_session_id) |
             (PaperConfig.chat_session_id == chat_session_id)
         ).all()
 
         selection_map = {}
+        config_info_by_part = {}
         for c in paper_configs:
+            logger.info(
+                "[CONFIRMED_PAPER_CONFIG] session=%s source=%s part=%s total_marks=%s total_main_questions=%s selection_rules=%s",
+                eval_session_id,
+                "evaluation_session" if c.evaluation_session_id == eval_session_id else "chat_session",
+                c.paper_part,
+                c.total_marks,
+                c.total_main_questions,
+                c.selection_rules,
+            )
+            part_key = self._normalize_part_key(c.paper_part)
+            if part_key:
+                config_info_by_part[part_key] = {
+                    "total_marks": Decimal(str(c.total_marks)) if c.total_marks is not None else None,
+                    "total_main_questions": c.total_main_questions,
+                }
             if c.selection_rules:
                 # Normalize key to lower_snake_case for mapping
                 norm_key = c.paper_part.lower().replace(" ", "_")
@@ -564,7 +732,7 @@ class GradingService:
                 # Create a bare-bones item for scoring logic if not in scored_items
                 missing_item = {
                     "target": target,
-                    "max_marks": self._resolve_max_marks(target),
+                    "max_marks": self._resolve_max_marks(target, confirmed_mark_overrides),
                     "display_number": self._resolve_display_number(target, q_id)
                 }
                 # Try to find the key from mapped_answers if possible to capture the text even for skip-scored items
@@ -615,13 +783,16 @@ class GradingService:
             # so selection logic reflects real attempts instead of placeholder rows.
             main_q_id = str(main_q.id) if main_q else "orphan"
             if main_q_id not in part_scores[part_name]:
-                part_scores[part_name][main_q_id] = {"marks": [], "attempted": 0}
+                part_scores[part_name][main_q_id] = {"marks": [], "max_marks": [], "attempted": 0}
 
             if has_student_text:
                 part_scores[part_name][main_q_id]["attempted"] += 1
 
             if is_leaf:
                 part_scores[part_name][main_q_id]["marks"].append(final_marks)
+                part_scores[part_name][main_q_id]["max_marks"].append(
+                    Decimal(str(item_for_persistence.get("max_marks") or 0))
+                )
 
         self.db.flush()
 
@@ -634,7 +805,7 @@ class GradingService:
             for mq_id, data in section_map.items():
                 total = sum(data["marks"])
                 attempted = data["attempted"]
-                main_q_entries.append((total, attempted))
+                main_q_entries.append((mq_id, total, attempted))
 
             part_rules = norm_selection_map.get(part_name) or {}
             mode = str(part_rules.get('mode', 'all')).lower()
@@ -642,28 +813,98 @@ class GradingService:
             is_selection_mode = mode in ['any', 'choose_any', 'choose']
             count = part_rules.get('count') or part_rules.get('total') or part_rules.get('choose_any')
 
+            full_part_max = sum(sum(data.get("max_marks", [])) for data in section_map.values())
+            configured_part_total = (config_info_by_part.get(part_name) or {}).get("total_marks")
+            known_config_total = sum(
+                info["total_marks"]
+                for info in config_info_by_part.values()
+                if info.get("total_marks") is not None
+            )
+            session_total_marks = getattr(eval_session, "total_marks", None)
+            overall_total = Decimal(str(session_total_marks or 0)) if session_total_marks else Decimal(0)
+            inferred_part_total = None
+            if configured_part_total and configured_part_total > 0:
+                inferred_part_total = configured_part_total
+            elif overall_total > known_config_total and part_name in config_info_by_part:
+                missing_parts = [
+                    part_key
+                    for part_key, info in config_info_by_part.items()
+                    if info.get("total_marks") is None
+                ]
+                if len(missing_parts) == 1 and missing_parts[0] == part_name:
+                    inferred_part_total = overall_total - known_config_total
+
+            if (not is_selection_mode) and inferred_part_total and Decimal(0) < inferred_part_total < full_part_max:
+                main_max_values = [sum(data.get("max_marks", [])) for data in section_map.values()]
+                main_max_values = [value for value in main_max_values if value > 0]
+                typical_main_max = max(set(main_max_values), key=main_max_values.count) if main_max_values else Decimal(0)
+                if typical_main_max and inferred_part_total % typical_main_max == 0:
+                    inferred_count = int(inferred_part_total / typical_main_max)
+                    if 0 < inferred_count < len(main_q_entries):
+                        mode = "any"
+                        count = inferred_count
+                        is_selection_mode = True
+                        logger.info(
+                            "[INFERRED_SELECTION_RULES] part=%s inferred_total=%s typical_main_max=%s mode=any count=%s",
+                            part_name,
+                            inferred_part_total,
+                            typical_main_max,
+                            inferred_count,
+                        )
+            elif (not is_selection_mode) and part_name != "paper_i" and part_name in config_info_by_part:
+                attempted_count = sum(1 for data in section_map.values() if data.get("attempted", 0) > 0)
+                has_unattempted = any(data.get("attempted", 0) <= 0 for data in section_map.values())
+                if attempted_count > 0 and has_unattempted:
+                    mode = "attempted_only"
+                    count = attempted_count
+                    is_selection_mode = True
+                    logger.info(
+                        "[INFERRED_SELECTION_RULES] part=%s mode=attempted_only count=%s reason=missing_config_selection",
+                        part_name,
+                        attempted_count,
+                    )
+
             if is_selection_mode and count and len(main_q_entries) > int(count):
                 # New selection rule: prefer genuinely attempted main questions;
                 # only backfill with unattempted zero-mark questions when the paper
                 # requires more selected slots than were actually answered.
-                attempted_entries = [e for e in main_q_entries if e[1] > 0]
-                unattempted_entries = [e for e in main_q_entries if e[1] <= 0]
-                attempted_entries.sort(key=lambda x: (x[0], x[1]), reverse=True)
-                unattempted_entries.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                attempted_entries = [e for e in main_q_entries if e[2] > 0]
+                unattempted_entries = [e for e in main_q_entries if e[2] <= 0]
+                attempted_entries.sort(key=lambda x: (x[1], x[2]), reverse=True)
+                unattempted_entries.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
                 selected = attempted_entries[:int(count)]
                 if len(selected) < int(count):
                     selected.extend(unattempted_entries[: int(count) - len(selected)])
 
-                selected_totals = [e[0] for e in selected]
-                attempted_count = sum(1 for e in selected if e[1] > 0)
+                selected_totals = [e[1] for e in selected]
+                attempted_count = sum(1 for e in selected if e[2] > 0)
                 logger.info(
-                    f"Part {part_name}: Selected best {count}/{len(main_q_entries)} questions "
-                    f"({attempted_count} actually attempted)."
+                    "[GRADING_SELECTION] part=%s mode=%s required_count=%s main_questions=%s selected=%s attempted_selected=%s",
+                    part_name,
+                    mode,
+                    count,
+                    len(main_q_entries),
+                    [
+                        {
+                            "main_question_id": e[0],
+                            "awarded": str(e[1]),
+                            "attempted": e[2],
+                        }
+                        for e in selected
+                    ],
+                    attempted_count,
                 )
                 total_score_val += sum(selected_totals)
             else:
-                total_score_val += sum(e[0] for e in main_q_entries)
+                logger.info(
+                    "[GRADING_SELECTION] part=%s mode=%s required_count=%s main_questions=%s selected=all",
+                    part_name,
+                    mode,
+                    count,
+                    len(main_q_entries),
+                )
+                total_score_val += sum(e[1] for e in main_q_entries)
 
         eval_result.total_score = total_score_val.quantize(Decimal("0.01"))
         logger.info(f"Final Total Score (system-only, selection-aware): {eval_result.total_score}")
@@ -712,6 +953,11 @@ class GradingService:
         syllabus_text, rubric_text, questions = workflow._get_evaluation_context(eval_session.id)
         question_map = workflow._build_question_map_helper(questions)
         reference_map = self._load_confirmed_reference_map(eval_session.id, eval_session.session_id, user_id)
+        confirmed_mark_overrides = self._load_confirmed_mark_overrides(
+            eval_session_id=eval_session.id,
+            chat_session_id=eval_session.session_id,
+            questions=questions,
+        )
 
         scores = self.db.query(QuestionScore).filter(QuestionScore.evaluation_result_id == result.id).all()
 
@@ -744,7 +990,7 @@ class GradingService:
                 "student_text": student_text,
                 "reference_text": reference_text,
                 "target": target,
-                "max_marks": self._resolve_max_marks(target),
+                "max_marks": self._resolve_max_marks(target, confirmed_mark_overrides),
                 "awarded_marks": qs.awarded_marks,
                 "display_number": display_number,
                 "db_score_obj": qs
@@ -932,7 +1178,7 @@ class GradingService:
         if not reference_text or not student_text:
             return 0.0
 
-        sentences = [s.strip() for s in re.split(r'[.!?\n]', reference_text) if len(s.strip()) > 10]
+        sentences = self._split_reference_concepts(reference_text)
         if not sentences:
             with ml_semaphore:
                 emb1 = student_emb if student_emb is not None else _embedding_cache.get(student_text)
@@ -2317,6 +2563,13 @@ Return ONLY a valid JSON object mirroring the keys provided.
             logger.error(f"[OCR_CLEAN] Failed to batch clean OCR: {e}")
             return mapped_answers
 
+    def _split_reference_concepts(self, reference_text: str) -> List[str]:
+        concepts = [
+            re.sub(r"\s+", " ", item).strip(" -:\t\r\n")
+            for item in re.split(r"[;；.!?\n।]+", str(reference_text or ""))
+        ]
+        return [concept for concept in concepts if len(concept) >= 4]
+
     def _calculate_coverage_score(self, student_text: str, reference_text: str, max_marks: int, student_emb=None):
         """
         Measures how many key concepts from the reference the student covered.
@@ -2333,8 +2586,7 @@ Return ONLY a valid JSON object mirroring the keys provided.
         if not reference_text:
             return 0.0, "No reference"
 
-        sentences = re.split(r"(?<=[.!?])\s+", reference_text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) >= 4]
+        sentences = self._split_reference_concepts(reference_text)
 
         if not sentences:
             return 0.0, "No reference sentences"
@@ -2351,9 +2603,11 @@ Return ONLY a valid JSON object mirroring the keys provided.
         sentence_embs = torch.stack([_embedding_cache[s] for s in sentences])
         sims = _cosine_util().cos_sim(s_emb, sentence_embs)[0]
 
-        # Threshold: how similar must a sentence be to count as "covered"
-        # Relaxed from 0.32 to 0.28 to reward pooled concise bullet items without dilution.
-        threshold = 0.28 if max_marks <= 2 else 0.28
+        # Threshold: how similar must a reference point be to count as covered.
+        # Paper II references are usually semicolon-separated covering points.
+        # Keep this stricter than topical similarity so merely writing around
+        # the same topic does not count as explaining every point.
+        threshold = 0.28 if max_marks <= 2 else 0.46
         hits = int((sims >= threshold).sum().item())
 
         # Cap the denominator to a fair expected concept count for this question.
@@ -2361,9 +2615,40 @@ Return ONLY a valid JSON object mirroring the keys provided.
         # for full coverage. The previous max_marks * 0.60 cap let 2-3 loose
         # matches count as perfect coverage and inflated Paper II scores.
         expected_concepts = min(len(sentences), max(1, max_marks))
+        if max_marks > 2:
+            expected_concepts = max(2, expected_concepts)
         ratio = hits / max(1, expected_concepts)
 
         return min(1.0, ratio), f"{hits}/{len(sentences)} concepts covered"
+
+    def _calculate_explanation_quality(self, student_text: str, reference_text: str, max_marks: int, coverage: float) -> float:
+        if max_marks <= 2:
+            return 1.0
+
+        student_words = re.findall(r"\w+", str(student_text or ""))
+        if not student_words:
+            return 0.0
+
+        concepts = self._split_reference_concepts(reference_text)
+        expected_concepts = max(1, min(len(concepts), max_marks))
+        words_per_expected_concept = len(student_words) / expected_concepts
+
+        explanation_markers = [
+            "නිසා", "හේතුවෙන්", "එමගින්", "මෙමගින්", "ඒ නිසා", "බලපෑ", "වැඩි",
+            "වර්ධනය", "දියුණු", "ඇති විය", "පිහිටුව", "ක්‍රියාත්මක", "හඳුන්වා",
+            "ලැබුණි", "කරන ලදී", "විය", "සඳහා", "තුළින්",
+        ]
+        marker_hits = sum(1 for marker in explanation_markers if marker in student_text)
+
+        if words_per_expected_concept >= 10 and marker_hits >= 2:
+            return 1.0
+        if words_per_expected_concept >= 7 and marker_hits >= 1:
+            return 0.90
+        if words_per_expected_concept >= 5:
+            return 0.78
+        if coverage >= 0.75:
+            return 0.70
+        return 0.60
 
 
     # ----------------------------------------------------------
@@ -2573,15 +2858,12 @@ Return ONLY a valid JSON object mirroring the keys provided.
 
         logger.info(f"[COVERAGE] {coverage_debug} -> coverage_ratio={coverage:.3f}")
 
-        # Recalibrated blend for Paper II (Fairness Update March 2026)
-        if coverage > 0.60:
-            # High quality answer: value concepts (coverage) and keywords (relevance) more
-            e_s_w, e_c_w, e_r_w = 0.40, 0.45, 0.15
-        else:
-            # Lower quality or vague: semantic topicality is the safeguard
-            e_s_w, e_c_w, e_r_w = 0.60, 0.30, 0.10
+        explanation = self._calculate_explanation_quality(student_text, reference_text, max_marks, coverage)
 
-        score = (e_s_w * semantic) + (e_c_w * coverage) + (e_r_w * relevance)
+        # Paper II should reward covered marking points and explanatory depth.
+        # Semantic similarity is only topicality; it must not overpower missing
+        # covering points from the confirmed schema.
+        score = (0.20 * semantic) + (0.55 * coverage) + (0.15 * relevance) + (0.10 * explanation)
 
         # Apply depth penalty for very short essays
         depth_mult = self._calculate_depth_penalty(student_text, reference_text, max_marks, coverage)
@@ -2593,7 +2875,8 @@ Return ONLY a valid JSON object mirroring the keys provided.
 
         logger.info(
             f"[ESSAY_SCORE] semantic={semantic:.3f} coverage={coverage:.3f} "
-            f"relevance={relevance:.3f} depth_mult={depth_mult:.2f} style_mult={style_mult:.2f} -> score={score:.3f}"
+            f"relevance={relevance:.3f} explanation={explanation:.3f} "
+            f"depth_mult={depth_mult:.2f} style_mult={style_mult:.2f} -> score={score:.3f}"
         )
 
         return float(score)
@@ -2784,7 +3067,7 @@ Questions to evaluate:
                 response_json = res_data.get("text") or "{}"
                 try:
                     clean_json = re.sub(r'^```json\s*|\s*```$', '', response_json.strip(), flags=re.MULTILINE)
-                    data = json.loads(clean_json)
+                    data = json.loads(clean_json, strict=False)
 
                     if isinstance(data, list):
                         merged_data = {}
