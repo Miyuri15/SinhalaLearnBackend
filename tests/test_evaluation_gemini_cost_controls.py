@@ -2,6 +2,7 @@ import sys
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 from app.components.document_processing.services import classifier_service
 
@@ -9,6 +10,7 @@ from app.components.document_processing.services import classifier_service
 def _load_grading_service_class():
     fake_embeddings = types.ModuleType("app.shared.ai.embeddings")
     fake_embeddings.xlmr = MagicMock()
+    fake_embeddings.get_xlmr_model = lambda *args, **kwargs: MagicMock()
     fake_embeddings.ml_semaphore = None
     fake_embeddings.ensure_sentences_cached = lambda *args, **kwargs: None
     fake_embeddings._embedding_cache = {}
@@ -183,6 +185,67 @@ def test_local_ocr_marker_fallback_recovers_missing_short_and_sub_answers():
     assert classifier_service._count_visible_ocr_answer_blocks(answer_text) == 4
 
 
+def test_local_ocr_marker_fallback_splits_inline_numeric_paper_ii_subparts():
+    flat_structure = [
+        {"id": "q3", "label": "3", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "q3-1", "label": "3(1)", "parent_main_label": "3", "is_sub_question": True},
+        {"id": "q3-2", "label": "3(2)", "parent_main_label": "3", "is_sub_question": True},
+        {"id": "q3-3", "label": "3(3)", "parent_main_label": "3", "is_sub_question": True},
+        {"id": "q4", "label": "4", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "q4-1", "label": "4(1)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q4-2", "label": "4(2)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q4-3", "label": "4(3)", "parent_main_label": "4", "is_sub_question": True},
+    ]
+    answer_text = (
+        "03. (1) mission answer. (2) buddhist revival answer. "
+        "(3) hindu and muslim revival answer. "
+        "04. (1) colebrooke answer. (2) plantation answer. (3) middle class answer."
+    )
+
+    recovered = classifier_service._map_answers_from_visible_ocr_markers(
+        answer_text,
+        flat_structure,
+        existing={},
+        overwrite_existing=True,
+    )
+
+    assert recovered["q3-2"] == "buddhist revival answer"
+    assert recovered["q3-3"] == "hindu and muslim revival answer"
+    assert recovered["q4-3"] == "middle class answer"
+    assert "04" not in recovered["q3-3"]
+
+
+def test_local_ocr_marker_fallback_uses_sub_labels_when_db_order_is_shuffled():
+    flat_structure = [
+        {"id": "q4", "label": "4", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "q4-3", "label": "4(3)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q4-1", "label": "4(1)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q4-2", "label": "4(2)", "parent_main_label": "4", "is_sub_question": True},
+        {"id": "q5", "label": "5", "is_sub_question": False, "has_sub_questions": True},
+        {"id": "q5-2", "label": "5(2)", "parent_main_label": "5", "is_sub_question": True},
+        {"id": "q5-3", "label": "5(3)", "parent_main_label": "5", "is_sub_question": True},
+        {"id": "q5-1", "label": "5(1)", "parent_main_label": "5", "is_sub_question": True},
+    ]
+    answer_text = (
+        "04. (1) colebrooke answer. (2) plantation answer. (3) middle class answer. "
+        "05. (1) maccallum answer. (2) donoughmore answer. (3) soulbury answer."
+    )
+
+    recovered = classifier_service._map_answers_from_visible_ocr_markers(
+        answer_text,
+        flat_structure,
+        existing={},
+        overwrite_existing=True,
+    )
+
+    assert recovered["q4-1"] == "colebrooke answer"
+    assert recovered["q4-2"] == "plantation answer"
+    assert recovered["q4-3"] == "middle class answer"
+    assert recovered["q5-1"] == "maccallum answer"
+    assert recovered["q5-2"] == "donoughmore answer"
+    assert recovered["q5-3"] == "soulbury answer"
+
+
 def test_question_parsing_uses_configured_model(monkeypatch):
     calls = []
 
@@ -212,6 +275,374 @@ def test_question_parsing_uses_configured_model(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["json_mode"] is True
     assert calls[0]["model_name"] == "gemini-2.5-flash"
+
+
+def test_exam_normalization_infers_uniform_paper_i_marks_from_total():
+    result = classifier_service._normalize_extracted_exam_result(
+        {
+            "Paper_I": {
+                "config": {
+                    "total_marks": 40,
+                    "total_questions_available": 20,
+                    "selection_rules": {"mode": "all"},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": 2 if index <= 3 else 0,
+                    }
+                    for index in range(1, 21)
+                },
+            }
+        }
+    )
+
+    assert result["Paper_I"]["config"]["total_questions_available"] == 20
+    assert all(
+        question["marks"] == 2
+        for question in result["Paper_I"]["questions"].values()
+    )
+
+
+def test_exam_normalization_repairs_overall_total_leaked_into_paper_i():
+    result = classifier_service._normalize_extracted_exam_result(
+        {
+            "Paper_I": {
+                "config": {
+                    "total_marks": 100,
+                    "total_questions_available": 20,
+                    "selection_rules": {"mode": "all"},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": None,
+                    }
+                    for index in range(1, 21)
+                },
+            },
+            "Paper_II": {
+                "config": {
+                    "total_marks": 60,
+                    "total_questions_available": 8,
+                    "selection_rules": {"mode": "any", "count": 6},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": 12,
+                        "sub_questions": {
+                            "1": {"text": "A", "marks": 4},
+                            "2": {"text": "B", "marks": 4},
+                            "3": {"text": "C", "marks": 4},
+                        },
+                    }
+                    for index in range(1, 9)
+                },
+            },
+        }
+    )
+
+    assert result["Paper_I"]["config"]["total_marks"] == 40
+    assert all(
+        question["marks"] == 2
+        for question in result["Paper_I"]["questions"].values()
+    )
+    assert result["Paper_II"]["config"]["total_marks"] == 60
+
+
+def test_exam_normalization_repairs_common_paper_i_total_even_when_question_count_is_incomplete():
+    result = classifier_service._normalize_extracted_exam_result(
+        {
+            "Paper_I": {
+                "config": {
+                    "total_marks": 100,
+                    "suggested_weightage": 100,
+                    "total_questions_available": 9,
+                    "selection_rules": {"mode": "all"},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": None,
+                    }
+                    for index in range(1, 10)
+                },
+            },
+            "Paper_II": {
+                "config": {
+                    "total_marks": 60,
+                    "total_questions_available": 8,
+                    "selection_rules": {"mode": "any", "count": 5},
+                },
+                "questions": {
+                    str(index): {
+                        "type": "structured",
+                        "text": f"Question {index}",
+                        "marks": None,
+                        "sub_questions": {
+                            "a": {"text": "Sub A", "marks": 4},
+                        },
+                    }
+                    for index in range(1, 9)
+                },
+            },
+        }
+    )
+
+    assert result["Paper_I"]["config"]["total_marks"] == 40
+    assert result["Paper_I"]["config"]["suggested_weightage"] == 40
+    assert result["Paper_II"]["config"]["total_marks"] == 60
+
+
+def test_grading_resolves_max_marks_from_confirmed_override():
+    GradingService = _load_grading_service_class()
+    service = GradingService(MagicMock())
+    question = SimpleNamespace(
+        id="q-1",
+        question_text="Extracted question",
+        max_marks=2,
+        part_name="Paper_I",
+    )
+
+    assert service._resolve_max_marks(question, {"q-1": 1}) == 1
+
+
+def test_grading_distributes_confirmed_paper_config_total_across_leaf_questions():
+    GradingService = _load_grading_service_class()
+    from app.shared.models.evaluation_session import MarkingSchema, MarkingSchemaItem, PaperConfig
+    from app.shared.models.question_papers import Question
+
+    eval_session_id = uuid4()
+    chat_session_id = uuid4()
+    questions = [
+        Question(id=uuid4(), question_number=str(index), part_name="Paper_I", max_marks=2)
+        for index in range(1, 41)
+    ]
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return None if self.model is MarkingSchema else None
+
+        def all(self):
+            if self.model is MarkingSchemaItem:
+                return []
+            if self.model is PaperConfig:
+                return [
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_I",
+                        total_marks=40,
+                        is_confirmed=True,
+                    )
+                ]
+            return []
+
+    db = MagicMock()
+    db.query.side_effect = lambda model: FakeQuery(model)
+    service = GradingService(db)
+
+    overrides = service._load_confirmed_mark_overrides(eval_session_id, chat_session_id, questions)
+
+    assert len(overrides) == 40
+    assert set(overrides.values()) == {1}
+
+
+def test_confirmed_paper_config_corrects_stale_confirmed_schema_marks():
+    GradingService = _load_grading_service_class()
+    from app.shared.models.evaluation_session import MarkingSchema, MarkingSchemaItem, PaperConfig
+    from app.shared.models.question_papers import Question
+
+    eval_session_id = uuid4()
+    chat_session_id = uuid4()
+    questions = [
+        Question(id=uuid4(), question_number=str(index), part_name="Paper_I", max_marks=2)
+        for index in range(1, 41)
+    ]
+    schema = SimpleNamespace(id=uuid4(), evaluation_session_id=eval_session_id, is_confirmed=True)
+    stale_items = [
+        SimpleNamespace(question_id=question.id, max_marks=2)
+        for question in questions
+    ]
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return schema if self.model is MarkingSchema else None
+
+        def all(self):
+            if self.model is MarkingSchemaItem:
+                return stale_items
+            if self.model is PaperConfig:
+                return [
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_I",
+                        total_marks=40,
+                        is_confirmed=True,
+                    )
+                ]
+            return []
+
+    db = MagicMock()
+    db.query.side_effect = lambda model: FakeQuery(model)
+    service = GradingService(db)
+
+    overrides = service._load_confirmed_mark_overrides(eval_session_id, chat_session_id, questions)
+
+    assert len(overrides) == 40
+    assert set(overrides.values()) == {1}
+
+
+def test_paper_ii_scoring_weights_covered_points_over_topic_similarity():
+    GradingService = _load_grading_service_class()
+    service = GradingService(MagicMock())
+    service._semantic_similarity = MagicMock(return_value=1.0)
+    service._calculate_relevance_score = MagicMock(return_value=1.0)
+    service._calculate_coverage_score = MagicMock(return_value=(0.25, "1/4 concepts covered"))
+    service._calculate_explanation_quality = MagicMock(return_value=0.70)
+    service._calculate_depth_penalty = MagicMock(return_value=1.0)
+    service._calculate_formal_language_penalty = MagicMock(return_value=1.0)
+
+    score = service._calculate_system_score(
+        student_text="Topically related answer with only one covering point.",
+        reference_text="point one; point two; point three; point four",
+        weights={"semantic": 0.4, "coverage": 0.4, "relevance": 0.2},
+        max_marks=4,
+    )
+
+    assert score < 0.60
+
+
+def test_reference_concept_split_uses_schema_semicolon_points():
+    GradingService = _load_grading_service_class()
+    service = GradingService(MagicMock())
+
+    concepts = service._split_reference_concepts(
+        "දේශපාලන ස්ථාවරත්වය; ස්වාභාවික සම්පත් බහුල වීම; යටත්විජිත වෙළඳපොළ"
+    )
+
+    assert len(concepts) == 3
+
+
+def test_result_total_prefers_complete_confirmed_config_over_available_schema_total():
+    from app.services.evaluation.answer_evaluation_service import AnswerEvaluationService
+    from app.shared.models.evaluation_session import PaperConfig
+
+    eval_session_id = uuid4()
+    chat_session_id = uuid4()
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            if self.model is PaperConfig:
+                return [
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_I",
+                        total_marks=40,
+                    ),
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_II",
+                        total_marks=60,
+                    ),
+                ]
+            return []
+
+    db = MagicMock()
+    db.query.side_effect = lambda model: FakeQuery(model)
+    service = AnswerEvaluationService(db)
+    service.marking_schema_repository.get_marking_schema_by_session.return_value = SimpleNamespace(id=uuid4())
+    service.marking_schema_repository.get_marking_schema_items.return_value = [
+        SimpleNamespace(part_name="Paper_I", question_number=str(index), max_marks=2)
+        for index in range(1, 21)
+    ] + [
+        SimpleNamespace(part_name="Paper_II", question_number=f"{main}(1)", max_marks=4)
+        for main in range(1, 9)
+    ] + [
+        SimpleNamespace(part_name="Paper_II", question_number=f"{main}(2)", max_marks=4)
+        for main in range(1, 9)
+    ] + [
+        SimpleNamespace(part_name="Paper_II", question_number=f"{main}(3)", max_marks=4)
+        for main in range(1, 9)
+    ]
+
+    total = service._resolve_total_max(eval_session_id, chat_session_id, selection_map={})
+
+    assert total == 100
+
+
+def test_result_schema_total_applies_choose_any_when_no_complete_config():
+    from app.services.evaluation.answer_evaluation_service import AnswerEvaluationService
+    from app.shared.models.evaluation_session import PaperConfig
+
+    eval_session_id = uuid4()
+    chat_session_id = uuid4()
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            if self.model is PaperConfig:
+                return [
+                    SimpleNamespace(
+                        evaluation_session_id=None,
+                        chat_session_id=chat_session_id,
+                        paper_part="Paper_I",
+                        total_marks=40,
+                    )
+                ]
+            return []
+
+    db = MagicMock()
+    db.query.side_effect = lambda model: FakeQuery(model)
+    service = AnswerEvaluationService(db)
+    service.marking_schema_repository.get_marking_schema_by_session.return_value = SimpleNamespace(id=uuid4())
+    service.marking_schema_repository.get_marking_schema_items.return_value = [
+        SimpleNamespace(part_name="Paper_I", question_number=str(index), max_marks=2)
+        for index in range(1, 21)
+    ] + [
+        SimpleNamespace(part_name="Paper_II", question_number=f"{main}({sub})", max_marks=4)
+        for main in range(1, 9)
+        for sub in range(1, 4)
+    ]
+
+    total = service._resolve_total_max(
+        eval_session_id,
+        chat_session_id,
+        selection_map={"paper_ii": {"mode": "any", "count": 5}},
+    )
+
+    assert total == 100
 
 
 def test_reference_extraction_respects_request_budget(monkeypatch):
@@ -300,10 +731,267 @@ def test_reference_extraction_prompt_uses_per_question_evidence(monkeypatch):
     assert len(prompts) == 1
     assert "Evidence:\nEvidence for q-1" in prompts[0]
     assert "Do NOT use internal knowledge." in prompts[0]
+    assert "direct short answer only" in prompts[0]
+    assert "Do not write explanations or essay sentences." in prompts[0]
     assert "{syllabus_for_prompt}" not in prompts[0]
 
 
-def test_reference_extraction_drops_not_covered_and_uses_context_fallback(monkeypatch):
+def test_schema_reference_shaping_compacts_short_answer_prose():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "Correct direct answer. This extra explanatory sentence should not appear in Paper I.",
+        {"max_marks": 2, "part_name": "Paper_I", "question_type": "short"},
+    )
+
+    assert result == "Correct direct answer."
+
+
+def test_schema_reference_shaping_rejects_inline_not_found():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "School: NOT_FOUND, Society: Colombo Buddhist Theosophical Society",
+        {"max_marks": 2, "part_name": "Paper_I", "question_type": "short", "question_text": "Name two items"},
+    )
+
+    assert result == ""
+
+
+def test_schema_reference_shaping_keeps_only_one_requested_reason():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "වැසි සමය ආරම්භ වීම, ලෙඩ රෝග පැතිර යාම, ආහාර හිඟ වීම",
+        {"max_marks": 2, "part_name": "Paper_I", "question_type": "short", "question_text": "එක් හේතුවක් සඳහන් කරන්න"},
+    )
+
+    assert result == "වැසි සමය ආරම්භ වීම"
+
+
+def test_schema_reference_shaping_rejects_missing_required_short_items():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "Only one clause is present.",
+        {"max_marks": 2, "part_name": "Paper_I", "question_type": "short", "question_text": "වගන්ති දෙකක් සඳහන් කරන්න"},
+    )
+
+    assert result == ""
+
+
+def test_schema_reference_shaping_turns_paper_ii_prose_into_covering_points():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    result = service._shape_reference_for_schema(
+        "First required point. Second required point. Third required point.",
+        {"max_marks": 4, "part_name": "Paper_II", "question_type": "essay"},
+    )
+
+    assert result == (
+        "1. First required point.\n"
+        "2. Second required point.\n"
+        "3. Third required point."
+    )
+
+
+def test_reference_extraction_uses_bounded_golden_fallback(monkeypatch):
+    calls = []
+
+    def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
+        calls.append(reason)
+        if reason == "bounded_golden_reference_fallback":
+            assert "Use ONLY the uploaded source" in prompt
+            return '{"ref_1": "Bounded syllabus answer"}'
+        return '{"ref_1": "NOT_FOUND"}'
+
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    grading_module = sys.modules["app.services.evaluation.grading_service"]
+    monkeypatch.setattr(grading_module, "gemini_generate_evaluation", fake_gemini_generate_evaluation)
+    service = GradingService(db)
+
+    result = service._batch_extract_reference_points(
+        [
+            {
+                "key": "q-1",
+                "target": SimpleNamespace(correct_answer=None),
+                "question_text": "Question text",
+                "max_marks": 2,
+                "display_number": "1",
+                "part_name": "Paper_I",
+                "question_type": "short",
+            }
+        ],
+        "Uploaded syllabus source with the relevant topic.",
+    )
+
+    assert result == {"q-1": "Bounded syllabus answer"}
+    assert "bounded_golden_reference_fallback" in calls
+
+
+def test_reference_extraction_does_not_use_unbounded_single_question_repair(monkeypatch):
+    calls = []
+
+    def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
+        calls.append(reason)
+        return '{"ref_1": "NOT_FOUND"}'
+
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    grading_module = sys.modules["app.services.evaluation.grading_service"]
+    monkeypatch.setattr(grading_module, "gemini_generate_evaluation", fake_gemini_generate_evaluation)
+    service = GradingService(db)
+
+    result = service._batch_extract_reference_points(
+        [
+            {
+                "key": "q-1",
+                "target": SimpleNamespace(correct_answer=None),
+                "question_text": "Question text",
+                "max_marks": 2,
+                "display_number": "1",
+                "part_name": "Paper_I",
+                "question_type": "short",
+            }
+        ],
+        "Uploaded syllabus source with the relevant topic.",
+    )
+
+    assert result == {}
+    assert not any(str(call).startswith("single_question_reference_repair_") for call in calls)
+
+
+def test_paper_i_max_marks_are_repaired_from_question_part():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    target = SimpleNamespace(
+        max_marks=5,
+        part_name="Paper_I",
+        question_text="Short answer question",
+        sub_questions=[],
+    )
+
+    assert service._resolve_max_marks(target) == 2
+
+
+def test_paper_i_max_marks_prefers_explicit_question_text_marks():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    target = SimpleNamespace(
+        max_marks=5,
+        part_name="Paper_I",
+        question_text="Short answer question (01 marks)",
+        sub_questions=[],
+    )
+
+    assert service._resolve_max_marks(target) == 1
+
+
+def test_build_reference_map_uses_syllabus_text_for_extraction(monkeypatch):
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+    captured = {}
+
+    def fake_batch_extract(questions, reference_source):
+        captured["reference_source"] = reference_source
+        return {"q-1": "Official marking answer"}
+
+    monkeypatch.setattr(service, "_batch_extract_reference_points", fake_batch_extract)
+
+    target = SimpleNamespace(id="q-1", correct_answer=None, question_type="short")
+    result = service.build_reference_map_for_targets(
+        eval_session_id=SimpleNamespace(),
+        syllabus_text="Syllabus note evidence",
+        rubric_text="Official marking schema evidence",
+        targets=[
+            {
+                "key": "q-1",
+                "target": target,
+                "question_text": "Question text",
+                "max_marks": 2,
+                "question_number": "1",
+                "part_name": "Paper_I",
+            }
+        ],
+    )
+
+    assert result == {"q-1": "Official marking answer"}
+    assert captured["reference_source"] == "Syllabus note evidence"
+    assert "Official marking schema evidence" not in captured["reference_source"]
+
+
+def test_build_reference_map_leaves_blank_when_no_syllabus_reference_found(monkeypatch):
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    monkeypatch.setattr(service, "_batch_extract_reference_points", lambda questions, source: {})
+    monkeypatch.setattr(service, "_get_reference_context", lambda *args, **kwargs: "Unsafe fallback excerpt")
+
+    target = SimpleNamespace(id="q-1", correct_answer=None, question_type="essay")
+    result = service.build_reference_map_for_targets(
+        eval_session_id=SimpleNamespace(),
+        syllabus_text="Syllabus note evidence",
+        rubric_text="",
+        targets=[
+            {
+                "key": "q-1",
+                "target": target,
+                "question_text": "Question text",
+                "max_marks": 5,
+                "question_number": "1(a)",
+                "part_name": "Paper_II",
+            }
+        ],
+    )
+
+    assert result == {"q-1": ""}
+
+
+def test_build_reference_map_does_not_use_question_correct_answer_without_syllabus(monkeypatch):
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    monkeypatch.setattr(service, "_batch_extract_reference_points", lambda questions, source: {})
+    target = SimpleNamespace(id="q-1", correct_answer="Stale generated answer", question_type="short")
+
+    result = service.build_reference_map_for_targets(
+        eval_session_id=SimpleNamespace(),
+        syllabus_text="",
+        rubric_text="",
+        targets=[
+            {
+                "key": "q-1",
+                "target": target,
+                "question_text": "Question text",
+                "max_marks": 2,
+                "question_number": "1",
+                "part_name": "Paper_I",
+            }
+        ],
+    )
+
+    assert result == {"q-1": ""}
+
+
+def test_reference_extraction_drops_not_covered_without_context_fallback(monkeypatch):
     def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
         return '{"ref_1": "මෙම සාක්ෂිය තුළ මැකඩම් මාර්ග තැනීම පිළිබඳ තොරතුරු අඩංගු නොවේ."}'
 
@@ -332,10 +1020,10 @@ def test_reference_extraction_drops_not_covered_and_uses_context_fallback(monkey
         "Long syllabus content",
     )
 
-    assert result == {"q-1": "Retrieved syllabus evidence"}
+    assert result == {}
 
 
-def test_reference_extraction_drops_additional_sinhala_placeholder_variants(monkeypatch):
+def test_reference_extraction_drops_additional_sinhala_placeholder_variants_without_context_fallback(monkeypatch):
     def fake_gemini_generate_evaluation(prompt, *, budget, json_mode=False, reason=None):
         return '{"ref_1": "මෙම සාධක වලින් එකක්වත් ලබා දී ඇති සාක්ෂිවල අඩංගු නොවේ."}'
 
@@ -364,7 +1052,7 @@ def test_reference_extraction_drops_additional_sinhala_placeholder_variants(monk
         "Long syllabus content",
     )
 
-    assert result == {"q-1": "Recovered evidence block"}
+    assert result == {}
 
 
 def test_reference_extraction_maps_display_number_keys_back_to_question_ids(monkeypatch):
@@ -424,6 +1112,32 @@ def test_reference_extraction_rejects_raw_page_fallback_context(monkeypatch):
     )
 
     assert result == {}
+
+
+def test_reference_extraction_recovers_pairs_from_truncated_json(monkeypatch):
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+
+    parsed = service._safe_reference_json_loads(
+        '{"ref_1": "First reference", "ref_2": "Second reference", "ref_3": "unfinished'
+    )
+
+    assert parsed["ref_1"] == "First reference"
+    assert parsed["ref_2"] == "Second reference"
+
+
+def test_syllabus_fallback_keeps_clipped_context_without_marker():
+    db = MagicMock()
+    GradingService = _load_grading_service_class()
+    service = GradingService(db)
+    service._build_reference_context_block = MagicMock(
+        return_value="Useful syllabus text about the answer. [Context Clipped]"
+    )
+
+    result = service._build_syllabus_fallback_reference({"max_marks": 2}, "source")
+
+    assert result == "Useful syllabus text about the answer."
 
 
 def test_generate_initial_marking_scheme_passes_target_to_reference_extraction(monkeypatch):
@@ -552,3 +1266,154 @@ II ශ්‍රකාටස - විග්‍රහාත්මක රචනා 
     assert set(backfilled["Paper_II"]["questions"]) == {"1", "2", "3"}
     assert backfilled["Paper_II"]["config"]["total_questions_available"] == 3
     assert set(backfilled["Paper_II"]["questions"]["2"]["sub_questions"]) == {"අ"}
+
+
+def test_backfill_paper_ii_questions_when_numbers_share_line_with_text():
+    text = """
+I part
+1. Short question.
+
+II part
+1. Main question one
+(1) Sub part one
+(2) Sub part two
+2. Main question two
+1) Numeric sub part one
+2) Numeric sub part two
+3. Main question three
+4. Main question four
+5. Main question five
+6. Main question six
+7. Main question seven
+8. Main question eight
+"""
+    parsed = {
+        "Paper_I": {"config": {}, "questions": {"1": {"text": "Short question."}}},
+        "Paper_II": {"config": {}, "questions": {"1": {"text": "only one"}}},
+    }
+
+    backfilled = classifier_service._backfill_missing_segmented_questions(parsed, text)
+
+    assert set(backfilled["Paper_II"]["questions"]) == {str(i) for i in range(1, 9)}
+    assert backfilled["Paper_II"]["config"]["total_questions_available"] == 8
+    assert set(backfilled["Paper_II"]["questions"]["2"]["sub_questions"]) == {"1", "2"}
+
+
+def test_question_paper_parser_splits_inline_numeric_subparts():
+    section = (
+        "02. (1) First essay subpart. (04 marks) "
+        "(2) Second essay subpart. (04 marks) "
+        "(3) Third essay subpart. (04 marks) "
+        "03. (1) Another first subpart. (04 marks) "
+        "(2) Another second subpart. (04 marks) "
+        "04. (1) One subpart only. (04 marks) "
+        "05. (1) First of four. (04 marks) "
+        "(2) Second of four. (04 marks) "
+        "(3) Third of four. (04 marks) "
+        "(4) Fourth of four. (04 marks) "
+        "06. (9) Ninth subpart. (04 marks) "
+        "(10) Tenth subpart. (04 marks)"
+    )
+
+    questions = classifier_service._extract_structured_main_questions_from_section(section)
+
+    assert set(questions) == {"2", "3", "4", "5", "6"}
+    assert set(questions["2"]["sub_questions"]) == {"1", "2", "3"}
+    assert questions["2"]["sub_questions"]["2"]["text"].startswith("Second essay subpart")
+    assert set(questions["3"]["sub_questions"]) == {"1", "2"}
+    assert set(questions["4"]["sub_questions"]) == {"1"}
+    assert set(questions["5"]["sub_questions"]) == {"1", "2", "3", "4"}
+    assert set(questions["6"]["sub_questions"]) == {"9", "10"}
+
+
+def test_segment_exam_text_detects_ocr_rakotasa_headers():
+    text = """
+1 \u0dbb\u0d9a\u0dcf\u0da7\u0dc3 - short answers
+1. Short question.
+
+2 \u0dbb\u0d9a\u0dcf\u0da7\u0dc3 - long answers
+01.
+(1) Long sub question.
+"""
+
+    sections = classifier_service._segment_exam_text_by_paper_headers(text)
+
+    assert set(sections) == {"Paper_I", "Paper_II"}
+    assert "Long sub question" in sections["Paper_II"]
+
+
+def test_segment_exam_text_infers_paper_ii_from_zero_padded_restart():
+    text = """
+History paper
+1. Short question one.
+2. Short question two.
+3. Short question three.
+4. Short question four.
+5. Short question five.
+6. Short question six.
+7. Short question seven.
+8. Short question eight.
+9. Short question nine.
+10. Short question ten.
+20. Short question twenty.
+
+Noisy OCR section header that is not readable
+01.
+(1) Long answer sub question one.
+(2) Long answer sub question two.
+02.
+(1) Second long answer.
+"""
+
+    sections = classifier_service._segment_exam_text_by_paper_headers(text)
+
+    assert set(sections) == {"Paper_I", "Paper_II"}
+    assert "20. Short question twenty" in sections["Paper_I"]
+    assert sections["Paper_II"].startswith("01.")
+    assert "02." in sections["Paper_II"]
+
+
+def test_local_question_extraction_repairs_short_answer_ocr_40_series_markers():
+    text = """
+1. First short question. (02 ලකුණු)
+2. Second short question. (02 ලකුණු)
+3. Third short question. (02 ලකුණු)
+4. Fourth short question. (02 ලකුණු)
+5. Fifth short question. (02 ලකුණු)
+6. Sixth short question. (02 ලකුණු)
+7. Seventh short question. (02 ලකුණු)
+8. Eighth short question. (02 ලකුණු)
+9. Ninth short question. (02 ලකුණු)
+40. Tenth short question. (02 ලකුණු)
+41. Eleventh short question. (02 ලකුණු)
+12. Twelfth short question. (02 ලකුණු)
+13. Thirteenth short question. (02 ලකුණු)
+14. Fourteenth short question. (02 ලකුණු)
+15. Fifteenth short question. (02 ලකුණු)
+16. Sixteenth short question. (02 ලකුණු)
+47. Seventeenth short question. (02 ලකුණු)
+48. Eighteenth short question. (02 ලකුණු)
+19. Nineteenth short question. (02 ලකුණු)
+20. Twentieth short question. (02 ලකුණු)
+"""
+
+    questions = classifier_service._extract_structured_main_questions_from_section(text)
+
+    assert set(questions) == {str(i) for i in range(1, 21)}
+    assert questions["10"]["text"].startswith("Tenth")
+    assert questions["17"]["text"].startswith("Seventeenth")
+    assert questions["18"]["text"].startswith("Eighteenth")
+
+
+def test_local_question_extraction_preserves_real_forty_series_markers():
+    text = """
+38. Thirty eighth question.
+39. Thirty ninth question.
+40. Fortieth question.
+41. Forty first question.
+"""
+
+    questions = classifier_service._extract_structured_main_questions_from_section(text)
+
+    assert set(questions) == {"38", "39", "40", "41"}
+    assert questions["40"]["text"].startswith("Fortieth")

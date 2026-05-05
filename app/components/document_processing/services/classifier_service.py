@@ -179,10 +179,128 @@ def _count_questions_with_subparts(questions: dict) -> int:
     return sum(1 for q in (questions or {}).values() if _question_has_sub_questions(q))
 
 
+def _coerce_positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _repair_uniform_plain_question_marks(paper_key: str, paper: dict) -> None:
+    if not isinstance(paper, dict):
+        return
+
+    questions = paper.get("questions", {}) or {}
+    config = paper.get("config", {}) or {}
+    if not isinstance(questions, dict) or not questions:
+        return
+
+    total_marks = _coerce_positive_int(config.get("total_marks"))
+    if not total_marks:
+        return
+
+    plain_questions = [
+        question
+        for question in questions.values()
+        if isinstance(question, dict) and not _question_has_sub_questions(question)
+    ]
+    if len(plain_questions) != len(questions):
+        return
+
+    question_count = len(plain_questions)
+    if total_marks % question_count != 0:
+        return
+
+    inferred_marks = total_marks // question_count
+    normalized_known_marks: list[int] = []
+    for question in plain_questions:
+        mark = _coerce_positive_int(question.get("marks"))
+        if mark is not None:
+            question["marks"] = mark
+            normalized_known_marks.append(mark)
+        else:
+            question["marks"] = None
+
+    if normalized_known_marks and any(mark != inferred_marks for mark in normalized_known_marks):
+        return
+
+    missing_count = sum(1 for question in plain_questions if question.get("marks") is None)
+    if missing_count:
+        for question in plain_questions:
+            if question.get("marks") is None:
+                question["marks"] = inferred_marks
+        logger.warning(
+            "Inferred %s mark(s) for %s plain question(s) in %s from total_marks=%s and question_count=%s.",
+            inferred_marks,
+            missing_count,
+            paper_key,
+            total_marks,
+            question_count,
+        )
+
+
+def _repair_overall_total_leak(cleaned_result: dict[str, dict]) -> None:
+    paper_totals: dict[str, int] = {}
+    for paper_key, paper in (cleaned_result or {}).items():
+        if not isinstance(paper, dict):
+            continue
+        config = paper.get("config", {}) or {}
+        total_marks = _coerce_positive_int(config.get("total_marks"))
+        if total_marks is not None:
+            paper_totals[str(paper_key)] = total_marks
+
+    if len(paper_totals) < 2:
+        return
+
+    for paper_key, total_marks in list(paper_totals.items()):
+        if total_marks < 100:
+            continue
+
+        other_total = sum(
+            value for key, value in paper_totals.items() if key != paper_key and value < total_marks
+        )
+        repaired_total = total_marks - other_total
+        if repaired_total <= 0 or repaired_total >= total_marks:
+            continue
+
+        paper = cleaned_result.get(paper_key) or {}
+        questions = paper.get("questions", {}) or {}
+        if not isinstance(questions, dict) or not questions:
+            continue
+
+        question_count = len(questions)
+        is_common_paper_i_overall_leak = (
+            str(paper_key) == "Paper_I"
+            and total_marks == 100
+            and 0 < repaired_total < total_marks
+        )
+        if not is_common_paper_i_overall_leak and repaired_total % question_count != 0:
+            continue
+
+        config = paper.setdefault("config", {})
+        config["total_marks"] = repaired_total
+        suggested_weightage = _coerce_positive_int(config.get("suggested_weightage"))
+        if suggested_weightage is None or suggested_weightage == total_marks:
+            config["suggested_weightage"] = repaired_total
+        logger.warning(
+            "Repaired %s total_marks from overall total %s to section total %s using other paper totals=%s.",
+            paper_key,
+            total_marks,
+            repaired_total,
+            other_total,
+        )
+
+
 _PAPER_HEADER_WORDS = (
     "paper",
     "part",
     "section",
+    "\u0d9a\u0ddc\u0da7\u0dc3",
+    "\u0d9a\u0dd9\u0dcf\u0da7\u0dc3",
+    "\u0d9a\u0dcf\u0da7\u0dc3",
+    "\u0dbb\u0d9a\u0dcf\u0da7\u0dc3",
+    "\u0db7\u0dcf\u0d9c\u0dba",
     "කොටස",
     "කොටස",
     "කාටස",
@@ -200,8 +318,8 @@ def _detect_paper_header_key(line: str) -> str | None:
 
     normalized = re.sub(r"\s+", " ", line.strip().lower())
     patterns = [
-        rf"^(?P<token>{_PAPER_TOKEN_PATTERN})\s*[-:.)]?\s*(?:{_PAPER_HEADER_WORD_PATTERN})\b",
-        rf"^(?:{_PAPER_HEADER_WORD_PATTERN})\s*[-: ]*\s*(?P<token>{_PAPER_TOKEN_PATTERN})\b",
+        rf"^(?P<token>{_PAPER_TOKEN_PATTERN})\s*[-:.)]?\s*(?:{_PAPER_HEADER_WORD_PATTERN})(?:\s|[-:.)]|$)",
+        rf"^(?:{_PAPER_HEADER_WORD_PATTERN})\s*[-: ]*\s*(?P<token>{_PAPER_TOKEN_PATTERN})(?:\s|[-:.)]|$)",
     ]
     for pattern in patterns:
         match = re.search(pattern, normalized, flags=re.IGNORECASE)
@@ -210,9 +328,81 @@ def _detect_paper_header_key(line: str) -> str | None:
     return None
 
 
+def _segment_exam_text_by_number_restart(text: str) -> dict[str, str]:
+    if not text:
+        return {}
+    text = str(text).replace("\f", "\n")
+
+    restart_pattern = re.compile(r"(?<!\d)0([1-9]|[12]\d)\s*[\.\)](?:\s+|\s*$)")
+    for match in restart_pattern.finditer(text):
+        lookahead = text[match.end():match.end() + 500]
+        if not re.search(r"(?:\(\s*[^)\s]{1,3}\s*\)|(?<!\d)[1-9]\s*[\.\)])", lookahead):
+            continue
+
+        before = text[:match.start()].strip()
+        after = text[match.start():].strip()
+        if not before or not after:
+            continue
+
+        earlier_plain_numbers = {
+            int(number_match.group(1))
+            for number_match in re.finditer(r"(?<!\d)([1-9]|1\d|20)\s*[\.\)]\s+", before)
+        }
+        if len(earlier_plain_numbers) < 5:
+            continue
+
+        logger.warning(
+            "Segmented exam text by zero-padded question restart at marker %s.",
+            match.group(0).strip(),
+        )
+        return {
+            "Paper_I": before,
+            "Paper_II": after,
+        }
+
+    return {}
+
+
+def _build_question_marker_matches(section_text: str) -> list[re.Match]:
+    line_pattern = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)0*(?P<label>[1-9]|[1-9]\d)\s*(?P<sep>[\.\)])(?:\s+|\s*$)"
+    )
+    line_matches = list(line_pattern.finditer(section_text))
+
+    zero_padded_pattern = re.compile(r"(?<!\d)0(?P<label>[1-9]|[12]\d)\s*(?P<sep>[\.\)])(?:\s+|\s*$)")
+    zero_padded_matches = list(zero_padded_pattern.finditer(section_text))
+    if len(zero_padded_matches) >= 2:
+        return zero_padded_matches
+
+    inline_pattern = re.compile(r"(?<!\d)(?P<label>[1-9]|[1-9]\d)\s*(?P<sep>[\.\)])\s+")
+    inline_matches = list(inline_pattern.finditer(section_text))
+    line_labels = {str(int(match.group("label"))) for match in line_matches}
+    inline_labels = {str(int(match.group("label"))) for match in inline_matches}
+
+    if len(inline_labels) > len(line_labels):
+        return inline_matches
+    return line_matches if line_matches else inline_matches
+
+
+def _interpret_question_marker_label(raw_label: str, expected_label: int | None) -> str:
+    raw_number = int(str(raw_label or "0"))
+    if expected_label and raw_number != expected_label:
+        text = str(raw_number)
+        expected_text = str(expected_label)
+        # Some OCR runs mistake leading `1` as `4`, producing 40/41/47/48
+        # inside a 1..20 sequence. Correct only when sequence context says the
+        # next question should be that exact number. A real question 40 after
+        # question 39 therefore remains 40.
+        if text.startswith("4") and len(text) == len(expected_text) and ("1" + text[1:]) == expected_text:
+            logger.warning("Interpreted OCR question marker %s as %s from sequence context.", raw_number, expected_label)
+            return expected_text
+    return str(raw_number)
+
+
 def _segment_exam_text_by_paper_headers(text: str) -> dict[str, str]:
     if not text:
         return {}
+    text = str(text).replace("\f", "\n")
 
     matches: list[tuple[str, int]] = []
     offset = 0
@@ -241,7 +431,7 @@ def _segment_exam_text_by_paper_headers(text: str) -> dict[str, str]:
 
     matches = list(header_pattern.finditer(text))
     if len(matches) < 2:
-        return {}
+        return _segment_exam_text_by_number_restart(text)
 
     sections: dict[str, str] = {}
     for index, match in enumerate(matches):
@@ -278,14 +468,36 @@ def _prepare_exam_text_for_prompt(text: str) -> str:
 def _extract_structured_main_questions_from_section(section_text: str) -> dict[str, dict]:
     if not section_text:
         return {}
+    section_text = str(section_text).replace("\f", "\n")
 
-    marker_pattern = re.compile(r"(?m)^\s*(?P<label>\d{1,2})\.\s*$")
-    matches = list(marker_pattern.finditer(section_text))
+    all_matches = _build_question_marker_matches(section_text)
+    matches_by_label: dict[str, tuple[int, re.Match]] = {}
+    expected_label: int | None = None
+    for match in all_matches:
+        label = _interpret_question_marker_label(match.group("label"), expected_label)
+        line_end = section_text.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(section_text)
+        line_tail = section_text[match.end():line_end].strip()
+        raw_token = match.group(0).strip()
+        has_leading_zero = bool(re.match(r"^0\d", raw_token))
+        is_standalone_marker = not line_tail
+
+        priority = 2 if has_leading_zero else 1 if is_standalone_marker or match.group("sep") == "." else 0
+        previous = matches_by_label.get(label)
+        if previous and previous[0] >= priority:
+            continue
+        matches_by_label[label] = (priority, match)
+        expected_label = int(label) + 1
+    matches = [item[1] for item in sorted(matches_by_label.values(), key=lambda item: item[1].start())]
+    interpreted_labels = {
+        item[1].start(): label
+        for label, item in matches_by_label.items()
+    }
     questions: dict[str, dict] = {}
 
     for index, match in enumerate(matches):
-        raw_label = match.group("label")
-        label = str(int(raw_label))
+        label = interpreted_labels.get(match.start(), str(int(match.group("label"))))
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(section_text)
         body = section_text[start:end].strip()
@@ -293,12 +505,23 @@ def _extract_structured_main_questions_from_section(section_text: str) -> dict[s
             continue
 
         sub_questions = {}
-        for sub_match in re.finditer(
-            r"(?ms)\(\s*(?P<label>[^)\s]{1,3})\s*\)\s*(?P<text>.*?)(?=\n\s*\(\s*[^)\s]{1,3}\s*\)|\Z)",
-            body,
-        ):
-            sub_label = sub_match.group("label").strip()
-            sub_text = re.sub(r"\s+", " ", sub_match.group("text")).strip()
+        sub_marker_pattern = re.compile(
+            r"(?ms)(?:^|\n|\s)"
+            r"(?:\(\s*(?P<label_paren>[^)\s]{1,4})\s*\)|(?P<label_numeric>[1-9]\d?)\s*[\.\)])\s*"
+        )
+        sub_matches: list[tuple[re.Match, str]] = []
+        for sub_match in sub_marker_pattern.finditer(body):
+            sub_label = (sub_match.group("label_paren") or sub_match.group("label_numeric") or "").strip()
+            if not _looks_like_sub_marker_token(sub_label, allow_numeric=True):
+                continue
+            sub_matches.append((sub_match, sub_label))
+
+        for sub_index, (sub_match, sub_label) in enumerate(sub_matches):
+            sub_start = sub_match.end()
+            sub_end = sub_matches[sub_index + 1][0].start() if sub_index + 1 < len(sub_matches) else len(body)
+            sub_text = re.sub(r"\s+", " ", body[sub_start:sub_end]).strip()
+            if not sub_text:
+                continue
             marks_match = re.search(r"\((\d{1,2})\s*[^\)]*ලකුණු\)", sub_text)
             sub_questions[sub_label] = {
                 "text": sub_text,
@@ -311,6 +534,7 @@ def _extract_structured_main_questions_from_section(section_text: str) -> dict[s
             "marks": sum(
                 value["marks"] for value in sub_questions.values() if value.get("marks") is not None
             ) or None,
+            "source_marker": match.group(0).strip(),
             "sub_questions": sub_questions,
         }
 
@@ -355,6 +579,45 @@ def _backfill_missing_segmented_questions(result: dict, original_text: str) -> d
     return result
 
 
+def _has_extracted_questions(result: dict) -> bool:
+    return any(
+        isinstance(paper_data, dict)
+        and isinstance(paper_data.get("questions"), dict)
+        and bool(paper_data.get("questions"))
+        for paper_data in (result or {}).values()
+    )
+
+
+def _build_locally_segmented_exam_result(text: str) -> dict:
+    sections = _segment_exam_text_by_paper_headers(text)
+    if not sections:
+        return {}
+
+    result: dict[str, dict] = {}
+    for paper_key, section_text in sections.items():
+        questions = _extract_structured_main_questions_from_section(section_text)
+        if not questions:
+            continue
+
+        result[paper_key] = {
+            "config": {
+                "subject_detected": "History",
+                "medium": "Sinhala",
+                "total_marks": None,
+                "total_questions_available": len(questions),
+                "suggested_weightage": None,
+                "selection_rules": {"mode": "all"},
+            },
+            "questions": questions,
+        }
+
+    if result:
+        logger.warning(
+            "Built exam structure from local segmented text after Gemini returned no usable questions."
+        )
+    return result
+
+
 def _normalize_extracted_exam_result(result: dict) -> dict:
     cleaned_result: dict[str, dict] = {}
     for paper_key, paper_data in (result or {}).items():
@@ -377,6 +640,10 @@ def _normalize_extracted_exam_result(result: dict) -> dict:
         normalized_paper["questions"] = ordered_questions
         cleaned_result[str(paper_key)] = normalized_paper
 
+    _repair_overall_total_leak(cleaned_result)
+    for paper_key, paper in cleaned_result.items():
+        _repair_uniform_plain_question_marks(str(paper_key), paper)
+
     paper_i = cleaned_result.get("Paper_I")
     paper_ii = cleaned_result.get("Paper_II")
     if paper_i and paper_ii:
@@ -391,7 +658,9 @@ def _normalize_extracted_exam_result(result: dict) -> dict:
             migrated: dict[str, dict] = {}
             remaining_paper_ii: dict[str, dict] = {}
             for label, question_data in paper_ii_questions.items():
-                if _question_has_sub_questions(question_data):
+                source_marker = str((question_data or {}).get("source_marker") or "")
+                came_from_zero_padded_main = bool(re.match(r"^0\d{1,2}\s*[\.\)]", source_marker))
+                if _question_has_sub_questions(question_data) or came_from_zero_padded_main:
                     remaining_paper_ii[label] = question_data
                 else:
                     migrated[label] = question_data
@@ -630,6 +899,7 @@ Analyze the text to determine how the paper should be graded.
    - DO NOT assume Paper I is always MCQ. It can contain structured questions too.
 2. **Total Marks:** 
    - Look for "මුළු ලකුණු" (Total Marks) for each section.
+   - Do NOT copy the full exam total into Paper I. If the paper total is 100 and Paper II is 60, Paper I total_marks must be 40.
    - For Paper I: If MCQs, usually 1 mark each. If structured, look for explicit marks.
    - For Paper II: Look for "Total Marks" or sum the sub-question marks.
 3. **Selection Rules:** Read instructions (e.g., "Answer 3 from 5").
@@ -732,9 +1002,11 @@ def extract_complete_exam_data(text: str):
 
         result = _safe_json_loads(response_text)
         if not result or not isinstance(result, dict):
-            return {}
+            result = {}
 
-        result = _backfill_missing_segmented_questions(result, prepared_text)
+        result = _backfill_missing_segmented_questions(result, text[:30000])
+        if not _has_extracted_questions(result):
+            result = _build_locally_segmented_exam_result(text[:30000])
             
         logger.info("Combined exam extraction completed successfully.")
         
@@ -1507,20 +1779,21 @@ def _is_invalid_mapped_answer(value: str) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in header_patterns)
 
 
-def _looks_like_sub_marker_token(token: str) -> bool:
+def _looks_like_sub_marker_token(token: str, *, allow_numeric: bool = False) -> bool:
     token = str(token or "").strip()
     if not token or len(token) > 4:
         return False
     if re.search(r'\d', token):
-        return False
+        return bool(allow_numeric and re.fullmatch(r'[1-9]\d?', token))
     return bool(re.search(r'[A-Za-z\u0D80-\u0DFF]', token))
 
 
 def _find_long_answer_start(answer_text: str) -> int:
     text = str(answer_text or "")
     patterns = [
-        r'(?<!\d)0[1-9]\s*[\.\)]\s*\(\s*[\u0D80-\u0DFFA-Za-z]{1,4}\s*\)',
+        r'(?<!\d)0?[1-9]\s*[\.\)]\s*\(\s*[\u0D80-\u0DFFA-Za-z1-9]{1,4}\s*\)',
         r'(?<!\d)0[1-9]\s*[\.\)]\s*[A-Za-z]\b',
+        r'(?m)^\s*0?[1-9]\s*[\.\)](?:[^\n]*\n\s*\(\s*[\u0D80-\u0DFFA-Za-z1-9]{1,4}\s*\)|[^\n]*\n\s*[1-9]\s*[\.\)])',
     ]
     starts = []
     for pattern in patterns:
@@ -1547,42 +1820,74 @@ def _extract_numeric_answer_blocks(text: str) -> dict[str, str]:
     return blocks
 
 
-def _extract_long_answer_sub_blocks(text: str) -> dict[str, list[str]]:
+def _extract_long_answer_sub_blocks(text: str) -> dict[str, dict[str, str]]:
     source = str(text or "")
-    main_pattern = re.compile(
+    inline_main_pattern = re.compile(
         r'(?<!\d)0*([1-9]|[12]\d)\s*[\.\)]\s*\(\s*([^)]+?)\s*\)',
         flags=re.IGNORECASE,
     )
-    main_matches = [
-        match for match in main_pattern.finditer(source)
-        if _looks_like_sub_marker_token(match.group(2))
+    inline_main_matches = [
+        match for match in inline_main_pattern.finditer(source)
+        if _looks_like_sub_marker_token(match.group(2), allow_numeric=True)
     ]
-    grouped: dict[str, list[str]] = {}
+    if inline_main_matches:
+        main_matches = inline_main_matches
+    else:
+        main_matches = []
+    main_pattern = re.compile(
+        r'(?m)^\s*0*([1-9]|[12]\d)\s*[\.\)](?:\s+|\s*$)',
+        flags=re.IGNORECASE,
+    )
+    if not main_matches:
+        for match in main_pattern.finditer(source):
+            lookahead = source[match.end():match.end() + 220]
+            if re.search(
+                r'(?m)(?:^\s*\(\s*([^)]+?)\s*\)|^\s*([1-9])\s*[\.\)]|^\s*[A-Za-z\u0D80-\u0DFF]\s*[\.\)])',
+                lookahead,
+                flags=re.IGNORECASE,
+            ):
+                main_matches.append(match)
+    grouped: dict[str, dict[str, str]] = {}
 
     for index, main_match in enumerate(main_matches):
         main_no = str(int(main_match.group(1)))
         block_end = main_matches[index + 1].start() if index + 1 < len(main_matches) else len(source)
         block = source[main_match.start():block_end]
-        sub_pattern = re.compile(r'\(\s*([^)]+?)\s*\)', flags=re.IGNORECASE)
-        sub_matches = [
-            match for match in sub_pattern.finditer(block)
-            if _looks_like_sub_marker_token(match.group(1))
-        ]
+        sub_pattern = re.compile(
+            r'(?m)(?:^\s*|(?<=\s))\(\s*(?P<label_paren>[^)\s]{1,3})\s*\)|(?:^|\n)\s*(?P<label_numeric>[1-9])\s*[\.\)]\s+',
+            flags=re.IGNORECASE,
+        )
+        sub_matches = []
+        for sub_match in sub_pattern.finditer(block):
+            if sub_match.start() == main_match.start():
+                continue
+            sub_label = sub_match.group("label_paren") or sub_match.group("label_numeric") or ""
+            if _looks_like_sub_marker_token(sub_label, allow_numeric=True):
+                sub_matches.append(sub_match)
         if not sub_matches:
             continue
 
-        values = []
+        values: dict[str, str] = {}
         for sub_index, sub_match in enumerate(sub_matches):
+            sub_label = (sub_match.group("label_paren") or sub_match.group("label_numeric") or "").strip()
             start = sub_match.end()
             end = sub_matches[sub_index + 1].start() if sub_index + 1 < len(sub_matches) else len(block)
             value = _clean_local_answer_block(block[start:end])
             # Preserve blank sub-parts as placeholders so later answers do not
             # shift into the wrong label, e.g. `(අ) answer (ආ) - (ඇ) answer`.
-            values.append(value)
-        if any(value for value in values):
+            values[sub_label] = value
+        if any(value for value in values.values()):
             grouped[main_no] = values
 
     return grouped
+
+
+def _extract_sub_label_from_flat_item(item: dict) -> str:
+    label = str((item or {}).get("label") or "").strip()
+    match = re.search(r"\(([^)]+)\)\s*$", label)
+    if match:
+        return match.group(1).strip()
+    return label
 
 
 def _map_answers_from_visible_ocr_markers(
@@ -1632,11 +1937,37 @@ def _map_answers_from_visible_ocr_markers(
         if (qid not in existing or overwrite_existing) and value and not _is_invalid_mapped_answer(value):
             recovered[qid] = value
 
-    for main_no, values in long_blocks.items():
+    for main_no, values_by_label in long_blocks.items():
         items = sub_items_by_main.get(main_no) or []
-        # Preserve question-paper order. Sinhala OCR often corrupts sub-labels,
-        # but the answer script usually keeps the written sub-parts in sequence.
-        for item, value in zip(items, values):
+        used_labels: set[str] = set()
+        for item in items:
+            sub_label = _extract_sub_label_from_flat_item(item)
+            value = values_by_label.get(sub_label)
+            if value is None:
+                normalized_sub_label = _normalize_answer_label_for_lookup(sub_label)
+                for candidate_label, candidate_value in values_by_label.items():
+                    if _normalize_answer_label_for_lookup(candidate_label) == normalized_sub_label:
+                        value = candidate_value
+                        sub_label = candidate_label
+                        break
+            if value is None:
+                continue
+            qid = str(item.get("id"))
+            if (qid not in existing or overwrite_existing) and value and not _is_invalid_mapped_answer(value):
+                recovered[qid] = value
+                used_labels.add(sub_label)
+
+        remaining_values = [
+            value
+            for label, value in values_by_label.items()
+            if label not in used_labels
+        ]
+        remaining_items = [
+            item
+            for item in items
+            if str(item.get("id")) not in recovered
+        ]
+        for item, value in zip(remaining_items, remaining_values):
             qid = str(item.get("id"))
             if (qid not in existing or overwrite_existing) and value and not _is_invalid_mapped_answer(value):
                 recovered[qid] = value
@@ -1653,7 +1984,7 @@ def _count_visible_ocr_answer_blocks(answer_text: str) -> int:
     long_count = sum(
         1
         for values in _extract_long_answer_sub_blocks(long_text).values()
-        for value in values
+        for value in values.values()
         if value
     )
     return short_count + long_count

@@ -34,9 +34,18 @@ class MarkingSchemaService:
         self.chat_sessions = ChatSessionService(db)
 
     def get_or_create_schema(self, session_id: UUID, user_id: UUID) -> MarkingSchemaResponse:
+        from app.services.evaluation.grading_service import GradingService
+
         eval_session = self._resolve_eval_session(session_id, user_id)
         schema = self.repository.get_marking_schema_by_session(eval_session.id)
         if schema:
+            if not schema.is_confirmed and self._schema_needs_regeneration(schema):
+                GradingService.clear_reference_cache(eval_session.id)
+                generated_items = self._generate_marking_schema_items(eval_session.id)
+                self.repository.replace_marking_schema_items(schema.id, generated_items)
+                self._sync_schema_resource(schema.id, eval_session.session_id, user_id)
+                logger.info("Regenerated unsafe draft marking schema for session %s", eval_session.id)
+                return self._to_response(self.repository.get_marking_schema_by_session(eval_session.id))
             logger.info("Loaded existing marking schema for session %s", eval_session.id)
             return self._to_response(schema)
 
@@ -54,7 +63,10 @@ class MarkingSchemaService:
         user_id: UUID,
         confirmed: bool = False,
     ) -> MarkingSchemaResponse:
+        from app.services.evaluation.grading_service import GradingService
+
         eval_session = self._resolve_eval_session(session_id, user_id)
+        GradingService.clear_reference_cache(eval_session.id)
         schema = self.repository.get_marking_schema_by_session(eval_session.id)
         if not schema:
             schema = self.repository.create_marking_schema(eval_session.id, is_confirmed=confirmed)
@@ -76,11 +88,14 @@ class MarkingSchemaService:
         return self.save_schema(session_id, payload, user_id, confirmed=True)
 
     def delete_schema(self, session_id: UUID, user_id: UUID) -> bool:
+        from app.services.evaluation.grading_service import GradingService
+
         eval_session = self._resolve_eval_session(session_id, user_id)
         schema = self.repository.get_marking_schema_by_session(eval_session.id)
         if not schema:
             return False
 
+        GradingService.clear_reference_cache(eval_session.id)
         resource_id = schema.resource_id
         deleted = self.repository.delete_marking_schema(eval_session.id)
         self.session_resources.detach_resources_by_label(eval_session.session_id, self.SESSION_RESOURCE_LABEL)
@@ -178,8 +193,12 @@ class MarkingSchemaService:
                         "key": str(sub_question.id),
                         "question_id": sub_question.id,
                         "question_number": number,
-                        "question_text": sub_question.sub_question_text or "",
-                        "max_marks": sub_question.max_marks,
+                        "question_text": self._clean_schema_question_text(sub_question.sub_question_text or ""),
+                        "max_marks": self._resolve_schema_max_marks(
+                            sub_question.max_marks,
+                            question.part_name,
+                            sub_question.sub_question_text or "",
+                        ),
                         "part_name": question.part_name,
                         "target": sub_question,
                         "sort_order": sort_order,
@@ -198,8 +217,12 @@ class MarkingSchemaService:
                     "key": str(question.id),
                     "question_id": question.id,
                     "question_number": str(question.question_number or ""),
-                    "question_text": question.question_text or "",
-                    "max_marks": question.max_marks,
+                    "question_text": self._clean_schema_question_text(question.question_text or ""),
+                    "max_marks": self._resolve_schema_max_marks(
+                        question.max_marks,
+                        question.part_name,
+                        question.question_text or "",
+                    ),
                     "part_name": question.part_name,
                     "target": question,
                     "sort_order": sort_order,
@@ -208,6 +231,78 @@ class MarkingSchemaService:
             sort_order += 1
 
         return targets
+
+    def _clean_schema_question_text(self, text: str) -> str:
+        cleaned = str(text or "").replace("\r", " ").replace("\n", " ")
+        cleaned = re.sub(r"---\s*PAGE\s+\d+\s*---", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.split(
+            r"(?:\bPaper\s*II\b|II\s+කොටස|2\s+කොටස|විග්‍රහාත්මක\s+රචනා\s+ප්‍රශ්න|à·€à·’à¶œà·Š)",
+            cleaned,
+            maxsplit=1,
+        )[0]
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _resolve_schema_max_marks(self, value: Optional[int], part_name: str, question_text: str) -> Optional[int]:
+        text_mark = self._extract_marks_from_text(question_text)
+        if text_mark:
+            return text_mark
+
+        if self._is_paper_i_part(part_name):
+            try:
+                parsed_value = int(value) if value else None
+            except (TypeError, ValueError):
+                parsed_value = None
+            if parsed_value in {1, 2}:
+                return parsed_value
+            return 2
+
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+        return value
+
+    def _extract_marks_from_text(self, text: str) -> Optional[int]:
+        patterns = [
+            r"\(\s*0?(\d{1,2})\s*(?:ලකුණු|marks|à¶½à¶šà·”à¶«à·”)",
+            r"(?:ලකුණු|marks|à¶½à¶šà·”à¶«à·”)\s*0?(\d{1,2})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, str(text or ""), flags=re.IGNORECASE)
+            if match:
+                try:
+                    mark = int(match.group(1))
+                    return mark if mark > 0 else None
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _is_paper_i_part(self, part_name: str) -> bool:
+        normalized = str(part_name or "").strip().lower().replace(" ", "_")
+        return normalized in {"paper_i", "part_i", "i"} or "paper_i" in normalized or "part_i" in normalized
+
+    def _schema_needs_regeneration(self, schema: MarkingSchema) -> bool:
+        items = self.repository.get_marking_schema_items(schema.id)
+        for item in items:
+            reference = str(item.reference_text or "")
+            question_text = str(item.question_text or "")
+            if self._is_paper_i_part(item.part_name) and item.max_marks and item.max_marks > 2:
+                return True
+            if self._is_paper_i_part(item.part_name) and len(reference) > 260:
+                return True
+            if re.search(r"NOT_FOUND|Reference points for this question will appear here|will appear here", reference, flags=re.IGNORECASE):
+                return True
+            if self._is_paper_i_part(item.part_name) and re.fullmatch(r"(?:[A-Za-z\u0D80-\u0DFF]\.\s*){1,4}", reference.strip()):
+                return True
+            if re.search(r"---\s*PAGE\s+\d+\s*---", question_text, flags=re.IGNORECASE):
+                return True
+            if re.search(r"---\s*(?:PAGE|TABLE)\b|\[Context Clipped\]", reference, flags=re.IGNORECASE):
+                return True
+            if any(marker in reference for marker in ["ක්රියාකාරකම", "ක්‍රියාකාරකම", "à¶šà·Šà¶»à·’à¶ºà·à¶šà·à¶»à¶šà¶¸"]):
+                return True
+        return False
 
     def _extract_questions_payload(self, payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload, MarkingSchemaUpdateRequest):

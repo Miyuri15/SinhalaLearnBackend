@@ -5,6 +5,7 @@ import re
 import json
 import time
 from math import floor
+from hashlib import sha256
 from uuid import UUID
 from typing import Dict, Any, List, Tuple, Optional, Callable
 from decimal import Decimal, ROUND_HALF_UP
@@ -25,7 +26,7 @@ from app.shared.models.answer_evaluation import (
 )
 from app.shared.models.question_papers import Question, SubQuestion
 from app.shared.models.session_resources import SessionResource
-from app.shared.models.evaluation_session import EvaluationSession, PaperConfig
+from app.shared.models.evaluation_session import EvaluationSession, MarkingSchema, MarkingSchemaItem, PaperConfig
 from app.shared.models.resource_file import ResourceFile
 from app.shared.models.rubrics import Rubric, RubricCriterion
 from app.shared.ai.embeddings import get_xlmr_model, ml_semaphore, ensure_sentences_cached, _embedding_cache
@@ -47,8 +48,22 @@ class GradingService:
     # Class-level cache: Gemini-extracted references, keyed by eval_session_id.
     # Survives across instances so multiple students in the same session
     # don't trigger redundant Gemini calls.
+    SCHEMA_REFERENCE_FORMAT_VERSION = "v7-budgeted-reference-extraction"
     _gemini_ref_cache: Dict[str, Dict[str, str]] = {}
     _gemini_ref_cache_lock = __import__('threading').Lock()
+
+    @classmethod
+    def clear_reference_cache(cls, eval_session_id: UUID) -> None:
+        """Drop cached generated references for a session after user edits/deletes schema."""
+        session_prefix = f"{eval_session_id}:"
+        with cls._gemini_ref_cache_lock:
+            stale_keys = [
+                cache_key
+                for cache_key in cls._gemini_ref_cache
+                if cache_key == str(eval_session_id) or cache_key.startswith(session_prefix)
+            ]
+            for cache_key in stale_keys:
+                del cls._gemini_ref_cache[cache_key]
 
     def __init__(self, db: Session):
         self.db = db
@@ -60,7 +75,28 @@ class GradingService:
     # ----------------------------------------------------------
     # MARK RESOLUTION
     # ----------------------------------------------------------
-    def _resolve_max_marks(self, question):
+    def _resolve_max_marks(self, question, confirmed_marks: Optional[Dict[str, int]] = None):
+        confirmed_marks = confirmed_marks or {}
+        question_id = str(getattr(question, "id", "") or "")
+        if question_id in confirmed_marks:
+            return confirmed_marks[question_id]
+
+        parsed_marks = self._extract_marks_from_question_text(
+            getattr(question, "question_text", "") or getattr(question, "sub_question_text", "")
+        )
+        if parsed_marks:
+            return parsed_marks
+
+        part_name = self._resolve_part_name(question)
+        if self._is_paper_i_part(part_name):
+            try:
+                parsed_value = int(getattr(question, "max_marks", 0) or 0)
+            except (TypeError, ValueError):
+                parsed_value = 0
+            if parsed_value in {1, 2}:
+                return parsed_value
+            return 2
+
         if hasattr(question, "max_marks") and question.max_marks:
             return int(question.max_marks)
 
@@ -73,6 +109,161 @@ class GradingService:
                 return max(1, int(parent.max_marks) // len(parent.sub_questions))
 
         return 1
+
+    def _normalize_part_key(self, part_name: str) -> str:
+        normalized = str(part_name or "").strip().lower().replace(" ", "_")
+        if re.search(r'(_iv|iv)$', normalized):
+            return "paper_iv"
+        if re.search(r'(_iii|iii)$', normalized):
+            return "paper_iii"
+        if re.search(r'(_ii|ii)$', normalized):
+            return "paper_ii"
+        if re.search(r'(_i|i)$', normalized):
+            return "paper_i"
+        return normalized
+
+    def _iter_leaf_targets(self, questions: List[Question]):
+        def iter_subs(sub_questions):
+            for sub_question in sub_questions or []:
+                children = getattr(sub_question, "children", []) or []
+                if children:
+                    yield from iter_subs(children)
+                else:
+                    yield sub_question
+
+        for question in questions or []:
+            sub_questions = getattr(question, "sub_questions", []) or []
+            if sub_questions:
+                yield from iter_subs(sub_questions)
+            else:
+                yield question
+
+    def _question_roots_from_map(self, question_map: Dict) -> List[Question]:
+        roots: Dict[str, Question] = {}
+        for target in {id(value): value for value in (question_map or {}).values()}.values():
+            if isinstance(target, Question):
+                roots[str(target.id)] = target
+            elif isinstance(target, SubQuestion) and getattr(target, "question", None):
+                roots[str(target.question.id)] = target.question
+        return list(roots.values())
+
+    def _load_confirmed_mark_overrides(
+        self,
+        eval_session_id: UUID,
+        chat_session_id: Optional[UUID],
+        questions: List[Question],
+    ) -> Dict[str, int]:
+        """
+        Build max-mark overrides from confirmed user-facing configuration.
+        Priority:
+        1. Confirmed marking-schema item max_marks, because those are per question.
+        2. Confirmed PaperConfig total_marks distributed across leaf targets in that part.
+        """
+        overrides: Dict[str, int] = {}
+
+        confirmed_schema = (
+            self.db.query(MarkingSchema)
+            .filter(
+                MarkingSchema.evaluation_session_id == eval_session_id,
+                MarkingSchema.is_confirmed.is_(True),
+            )
+            .first()
+        )
+        if confirmed_schema:
+            schema_items = (
+                self.db.query(MarkingSchemaItem)
+                .filter(MarkingSchemaItem.marking_schema_id == confirmed_schema.id)
+                .all()
+            )
+            for item in schema_items:
+                try:
+                    mark = int(item.max_marks) if item.max_marks is not None else None
+                except (TypeError, ValueError):
+                    mark = None
+                if mark and mark > 0 and item.question_id:
+                    overrides[str(item.question_id)] = mark
+
+        config_query = self.db.query(PaperConfig).filter(PaperConfig.is_confirmed.is_(True))
+        if chat_session_id:
+            config_query = config_query.filter(
+                (PaperConfig.evaluation_session_id == eval_session_id)
+                | (PaperConfig.chat_session_id == chat_session_id)
+            )
+        else:
+            config_query = config_query.filter(PaperConfig.evaluation_session_id == eval_session_id)
+
+        confirmed_configs = config_query.all()
+        if not confirmed_configs:
+            return overrides
+
+        configs_by_part: Dict[str, PaperConfig] = {}
+        for config in confirmed_configs:
+            part_key = self._normalize_part_key(config.paper_part)
+            if not part_key:
+                continue
+            existing = configs_by_part.get(part_key)
+            if existing is None or (
+                existing.evaluation_session_id is None and config.evaluation_session_id == eval_session_id
+            ):
+                configs_by_part[part_key] = config
+
+        leaf_targets = list(self._iter_leaf_targets(questions))
+        leaf_targets_by_part: Dict[str, List[Any]] = {}
+        for target in leaf_targets:
+            part_key = self._normalize_part_key(self._resolve_part_name(target))
+            leaf_targets_by_part.setdefault(part_key, []).append(target)
+
+        for part_key, config in configs_by_part.items():
+            try:
+                total_marks = int(config.total_marks) if config.total_marks is not None else None
+            except (TypeError, ValueError):
+                total_marks = None
+            targets = leaf_targets_by_part.get(part_key) or []
+            if not total_marks or total_marks <= 0 or not targets:
+                continue
+            if total_marks % len(targets) != 0:
+                continue
+            per_target_marks = total_marks // len(targets)
+            if per_target_marks <= 0:
+                continue
+            existing_part_marks = [
+                overrides.get(str(getattr(target, "id", "") or ""))
+                for target in targets
+            ]
+            existing_part_marks = [mark for mark in existing_part_marks if mark is not None]
+            should_apply_config_marks = (
+                len(existing_part_marks) != len(targets)
+                or sum(existing_part_marks) != total_marks
+            )
+            if not should_apply_config_marks:
+                continue
+            for target in targets:
+                target_id = str(getattr(target, "id", "") or "")
+                if target_id:
+                    overrides[target_id] = per_target_marks
+
+        return overrides
+
+    def _extract_marks_from_question_text(self, text: str) -> Optional[int]:
+        patterns = [
+            r"\(\s*0?(\d{1,2})\s*(?:ලකුණු|marks|à¶½à¶šà·”à¶«à·”)",
+            r"(?:ලකුණු|marks|à¶½à¶šà·”à¶«à·”)\s*0?(\d{1,2})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, str(text or ""), flags=re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                mark = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if mark > 0:
+                return mark
+        return None
+
+    def _is_paper_i_part(self, part_name: str) -> bool:
+        normalized = str(part_name or "").strip().lower().replace(" ", "_")
+        return normalized in {"paper_i", "part_i", "i"} or "paper_i" in normalized or "part_i" in normalized
 
     def _resolve_part_name(self, target) -> str:
         """
@@ -178,6 +369,18 @@ class GradingService:
 
         eval_session = self.db.query(EvaluationSession).filter(EvaluationSession.id == eval_session_id).first()
         rubric_weights = self._get_rubric_weights(eval_session)
+        chat_session_id = eval_session.session_id if eval_session else None
+        confirmed_mark_overrides = self._load_confirmed_mark_overrides(
+            eval_session_id=eval_session_id,
+            chat_session_id=chat_session_id,
+            questions=self._question_roots_from_map(question_map),
+        )
+        if confirmed_mark_overrides:
+            logger.info(
+                "Loaded %s confirmed max-mark override(s) for evaluation session %s.",
+                len(confirmed_mark_overrides),
+                eval_session_id,
+            )
 
         total_questions = len(answer_doc.mapped_answers)
         processed_count = 0
@@ -245,7 +448,7 @@ class GradingService:
             if isinstance(target, Question) and self._has_any_mapped_descendant(target, answer_doc.mapped_answers):
                 continue
 
-            max_marks = self._resolve_max_marks(target)
+            max_marks = self._resolve_max_marks(target, confirmed_mark_overrides)
             # PRIMARY: Gemini-extracted reference points
             # FALLBACK: BM25 retrieval from syllabus / correct_answer gold standard
             reference_text = gemini_ref_map.get(key)
@@ -296,7 +499,7 @@ class GradingService:
             seen_question_ids.add(target_id)
             seen_keys.add(key)
 
-            max_marks = self._resolve_max_marks(target)
+            max_marks = self._resolve_max_marks(target, confirmed_mark_overrides)
             # Use Gemini-extracted ref (primary) with BM25 fallback
             reference_text = gemini_ref_map.get(key) or self._get_reference_context(target, syllabus_text, rubric_text)
 
@@ -406,12 +609,29 @@ class GradingService:
 
         config_service = PaperConfigService(self.db)
         paper_configs = self.db.query(PaperConfig).filter(
+            PaperConfig.is_confirmed.is_(True),
             (PaperConfig.evaluation_session_id == eval_session_id) |
             (PaperConfig.chat_session_id == chat_session_id)
         ).all()
 
         selection_map = {}
+        config_info_by_part = {}
         for c in paper_configs:
+            logger.info(
+                "[CONFIRMED_PAPER_CONFIG] session=%s source=%s part=%s total_marks=%s total_main_questions=%s selection_rules=%s",
+                eval_session_id,
+                "evaluation_session" if c.evaluation_session_id == eval_session_id else "chat_session",
+                c.paper_part,
+                c.total_marks,
+                c.total_main_questions,
+                c.selection_rules,
+            )
+            part_key = self._normalize_part_key(c.paper_part)
+            if part_key:
+                config_info_by_part[part_key] = {
+                    "total_marks": Decimal(str(c.total_marks)) if c.total_marks is not None else None,
+                    "total_main_questions": c.total_main_questions,
+                }
             if c.selection_rules:
                 # Normalize key to lower_snake_case for mapping
                 norm_key = c.paper_part.lower().replace(" ", "_")
@@ -512,7 +732,7 @@ class GradingService:
                 # Create a bare-bones item for scoring logic if not in scored_items
                 missing_item = {
                     "target": target,
-                    "max_marks": self._resolve_max_marks(target),
+                    "max_marks": self._resolve_max_marks(target, confirmed_mark_overrides),
                     "display_number": self._resolve_display_number(target, q_id)
                 }
                 # Try to find the key from mapped_answers if possible to capture the text even for skip-scored items
@@ -563,13 +783,16 @@ class GradingService:
             # so selection logic reflects real attempts instead of placeholder rows.
             main_q_id = str(main_q.id) if main_q else "orphan"
             if main_q_id not in part_scores[part_name]:
-                part_scores[part_name][main_q_id] = {"marks": [], "attempted": 0}
+                part_scores[part_name][main_q_id] = {"marks": [], "max_marks": [], "attempted": 0}
 
             if has_student_text:
                 part_scores[part_name][main_q_id]["attempted"] += 1
 
             if is_leaf:
                 part_scores[part_name][main_q_id]["marks"].append(final_marks)
+                part_scores[part_name][main_q_id]["max_marks"].append(
+                    Decimal(str(item_for_persistence.get("max_marks") or 0))
+                )
 
         self.db.flush()
 
@@ -582,7 +805,7 @@ class GradingService:
             for mq_id, data in section_map.items():
                 total = sum(data["marks"])
                 attempted = data["attempted"]
-                main_q_entries.append((total, attempted))
+                main_q_entries.append((mq_id, total, attempted))
 
             part_rules = norm_selection_map.get(part_name) or {}
             mode = str(part_rules.get('mode', 'all')).lower()
@@ -590,28 +813,98 @@ class GradingService:
             is_selection_mode = mode in ['any', 'choose_any', 'choose']
             count = part_rules.get('count') or part_rules.get('total') or part_rules.get('choose_any')
 
+            full_part_max = sum(sum(data.get("max_marks", [])) for data in section_map.values())
+            configured_part_total = (config_info_by_part.get(part_name) or {}).get("total_marks")
+            known_config_total = sum(
+                info["total_marks"]
+                for info in config_info_by_part.values()
+                if info.get("total_marks") is not None
+            )
+            session_total_marks = getattr(eval_session, "total_marks", None)
+            overall_total = Decimal(str(session_total_marks or 0)) if session_total_marks else Decimal(0)
+            inferred_part_total = None
+            if configured_part_total and configured_part_total > 0:
+                inferred_part_total = configured_part_total
+            elif overall_total > known_config_total and part_name in config_info_by_part:
+                missing_parts = [
+                    part_key
+                    for part_key, info in config_info_by_part.items()
+                    if info.get("total_marks") is None
+                ]
+                if len(missing_parts) == 1 and missing_parts[0] == part_name:
+                    inferred_part_total = overall_total - known_config_total
+
+            if (not is_selection_mode) and inferred_part_total and Decimal(0) < inferred_part_total < full_part_max:
+                main_max_values = [sum(data.get("max_marks", [])) for data in section_map.values()]
+                main_max_values = [value for value in main_max_values if value > 0]
+                typical_main_max = max(set(main_max_values), key=main_max_values.count) if main_max_values else Decimal(0)
+                if typical_main_max and inferred_part_total % typical_main_max == 0:
+                    inferred_count = int(inferred_part_total / typical_main_max)
+                    if 0 < inferred_count < len(main_q_entries):
+                        mode = "any"
+                        count = inferred_count
+                        is_selection_mode = True
+                        logger.info(
+                            "[INFERRED_SELECTION_RULES] part=%s inferred_total=%s typical_main_max=%s mode=any count=%s",
+                            part_name,
+                            inferred_part_total,
+                            typical_main_max,
+                            inferred_count,
+                        )
+            elif (not is_selection_mode) and part_name != "paper_i" and part_name in config_info_by_part:
+                attempted_count = sum(1 for data in section_map.values() if data.get("attempted", 0) > 0)
+                has_unattempted = any(data.get("attempted", 0) <= 0 for data in section_map.values())
+                if attempted_count > 0 and has_unattempted:
+                    mode = "attempted_only"
+                    count = attempted_count
+                    is_selection_mode = True
+                    logger.info(
+                        "[INFERRED_SELECTION_RULES] part=%s mode=attempted_only count=%s reason=missing_config_selection",
+                        part_name,
+                        attempted_count,
+                    )
+
             if is_selection_mode and count and len(main_q_entries) > int(count):
                 # New selection rule: prefer genuinely attempted main questions;
                 # only backfill with unattempted zero-mark questions when the paper
                 # requires more selected slots than were actually answered.
-                attempted_entries = [e for e in main_q_entries if e[1] > 0]
-                unattempted_entries = [e for e in main_q_entries if e[1] <= 0]
-                attempted_entries.sort(key=lambda x: (x[0], x[1]), reverse=True)
-                unattempted_entries.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                attempted_entries = [e for e in main_q_entries if e[2] > 0]
+                unattempted_entries = [e for e in main_q_entries if e[2] <= 0]
+                attempted_entries.sort(key=lambda x: (x[1], x[2]), reverse=True)
+                unattempted_entries.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
                 selected = attempted_entries[:int(count)]
                 if len(selected) < int(count):
                     selected.extend(unattempted_entries[: int(count) - len(selected)])
 
-                selected_totals = [e[0] for e in selected]
-                attempted_count = sum(1 for e in selected if e[1] > 0)
+                selected_totals = [e[1] for e in selected]
+                attempted_count = sum(1 for e in selected if e[2] > 0)
                 logger.info(
-                    f"Part {part_name}: Selected best {count}/{len(main_q_entries)} questions "
-                    f"({attempted_count} actually attempted)."
+                    "[GRADING_SELECTION] part=%s mode=%s required_count=%s main_questions=%s selected=%s attempted_selected=%s",
+                    part_name,
+                    mode,
+                    count,
+                    len(main_q_entries),
+                    [
+                        {
+                            "main_question_id": e[0],
+                            "awarded": str(e[1]),
+                            "attempted": e[2],
+                        }
+                        for e in selected
+                    ],
+                    attempted_count,
                 )
                 total_score_val += sum(selected_totals)
             else:
-                total_score_val += sum(e[0] for e in main_q_entries)
+                logger.info(
+                    "[GRADING_SELECTION] part=%s mode=%s required_count=%s main_questions=%s selected=all",
+                    part_name,
+                    mode,
+                    count,
+                    len(main_q_entries),
+                )
+                total_score_val += sum(e[1] for e in main_q_entries)
 
         eval_result.total_score = total_score_val.quantize(Decimal("0.01"))
         logger.info(f"Final Total Score (system-only, selection-aware): {eval_result.total_score}")
@@ -660,6 +953,11 @@ class GradingService:
         syllabus_text, rubric_text, questions = workflow._get_evaluation_context(eval_session.id)
         question_map = workflow._build_question_map_helper(questions)
         reference_map = self._load_confirmed_reference_map(eval_session.id, eval_session.session_id, user_id)
+        confirmed_mark_overrides = self._load_confirmed_mark_overrides(
+            eval_session_id=eval_session.id,
+            chat_session_id=eval_session.session_id,
+            questions=questions,
+        )
 
         scores = self.db.query(QuestionScore).filter(QuestionScore.evaluation_result_id == result.id).all()
 
@@ -692,7 +990,7 @@ class GradingService:
                 "student_text": student_text,
                 "reference_text": reference_text,
                 "target": target,
-                "max_marks": self._resolve_max_marks(target),
+                "max_marks": self._resolve_max_marks(target, confirmed_mark_overrides),
                 "awarded_marks": qs.awarded_marks,
                 "display_number": display_number,
                 "db_score_obj": qs
@@ -786,11 +1084,15 @@ class GradingService:
                     "question_text": question_text,
                     "max_marks": target_info.get("max_marks") or self._resolve_max_marks(target),
                     "display_number": target_info.get("question_number") or target_info["key"],
+                    "part_name": target_info.get("part_name") or self._resolve_part_name(target),
                     "question_type": getattr(target, "question_type", "short") or "short",
                 }
             )
 
-        cache_key = str(eval_session_id)
+        reference_source = self._build_reference_source_text(syllabus_text, rubric_text)
+        cache_source = f"{self.SCHEMA_REFERENCE_FORMAT_VERSION}\n{reference_source}"
+        source_hash = sha256(cache_source.encode("utf-8")).hexdigest()[:12]
+        cache_key = f"{eval_session_id}:{source_hash}"
         gemini_ref_map: Dict[str, str] = {}
         with GradingService._gemini_ref_cache_lock:
             cached = GradingService._gemini_ref_cache.get(cache_key)
@@ -798,36 +1100,34 @@ class GradingService:
         if cached is not None:
             gemini_ref_map = cached
             logger.info("Using cached marking references for session %s (%s refs).", cache_key, len(gemini_ref_map))
-        elif syllabus_text and questions_for_extraction:
-            gemini_ref_map = self._batch_extract_reference_points(questions_for_extraction, syllabus_text)
+        elif reference_source and questions_for_extraction:
+            gemini_ref_map = self._batch_extract_reference_points(questions_for_extraction, reference_source)
             with GradingService._gemini_ref_cache_lock:
                 GradingService._gemini_ref_cache[cache_key] = gemini_ref_map
 
         final_map: Dict[str, str] = {}
         for target_info in targets:
             target = target_info["target"]
+            question_info = {
+                "key": target_info["key"],
+                "target": target,
+                "question_text": target_info.get("question_text") or "",
+                "max_marks": target_info.get("max_marks") or self._resolve_max_marks(target),
+                "display_number": target_info.get("question_number") or target_info["key"],
+                "part_name": target_info.get("part_name") or self._resolve_part_name(target),
+                "question_type": getattr(target, "question_type", "short") or "short",
+            }
             extracted_reference = gemini_ref_map.get(target_info["key"], "")
-            if extracted_reference and not self._is_placeholder_answer(extracted_reference):
-                final_map[target_info["key"]] = extracted_reference
+            shaped_reference = self._shape_reference_for_schema(extracted_reference, question_info)
+            if shaped_reference:
+                final_map[target_info["key"]] = shaped_reference
                 continue
 
-            syllabus_reference = self._get_reference_context(
-                target,
-                syllabus_text,
-                rubric_text,
-                prefer_gold_standard=False,
-            )
-            if syllabus_reference and not self._is_placeholder_answer(syllabus_reference):
-                final_map[target_info["key"]] = syllabus_reference
-                continue
-
-            final_map[target_info["key"]] = self._get_reference_context(
-                target,
-                syllabus_text,
-                rubric_text,
-                prefer_gold_standard=True,
-            )
+            final_map[target_info["key"]] = ""
         return final_map
+
+    def _build_reference_source_text(self, syllabus_text: str, rubric_text: str) -> str:
+        return (syllabus_text or "").strip()
 
     def _get_saved_reference_text(self, reference_map: Dict[str, str], key: str, target: Any) -> str:
         candidates = [str(key), self._normalize_question_lookup_key(key)]
@@ -878,7 +1178,7 @@ class GradingService:
         if not reference_text or not student_text:
             return 0.0
 
-        sentences = [s.strip() for s in re.split(r'[.!?\n]', reference_text) if len(s.strip()) > 10]
+        sentences = self._split_reference_concepts(reference_text)
         if not sentences:
             with ml_semaphore:
                 emb1 = student_emb if student_emb is not None else _embedding_cache.get(student_text)
@@ -1067,6 +1367,89 @@ class GradingService:
             context = context[:2200] + "... [Context Clipped]"
         return context
 
+    def _build_syllabus_fallback_reference(self, question_info: Dict[str, Any], syllabus_text: str) -> str:
+        context = self._build_reference_context_block(question_info, syllabus_text)
+        if not context:
+            return ""
+
+        cleaned = context.replace("[Context Clipped]", "")
+        cleaned = re.sub(r"---\s*(?:PAGE|TABLE)[^-]*---", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned or self._is_placeholder_answer(cleaned):
+            return ""
+        return self._shape_reference_for_schema(cleaned, question_info)
+
+    def _safe_reference_json_loads(self, text: str) -> Any:
+        if not text:
+            return {}
+
+        clean_text = re.sub(r'^```json\s*|\s*```$', '', text.strip(), flags=re.MULTILINE)
+        try:
+            return json.loads(clean_text)
+        except json.JSONDecodeError:
+            repaired = self._repair_reference_json(clean_text)
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                recovered = self._recover_reference_pairs(clean_text)
+                if recovered:
+                    logger.warning(
+                        "[GEMINI_REF] Recovered %s key(s) from malformed JSON response.",
+                        len(recovered),
+                    )
+                    return recovered
+                raise
+
+    def _repair_reference_json(self, text: str) -> str:
+        repaired = (text or "").strip()
+        if not repaired:
+            return "{}"
+        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+        repaired = re.sub(r",\s*$", "", repaired)
+        if repaired.count('"') % 2 != 0:
+            repaired += '"'
+
+        stack = []
+        in_string = False
+        escaped = False
+        for char in repaired:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\" and in_string:
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                stack.append("}")
+            elif char == "[":
+                stack.append("]")
+            elif char == "}" and stack and stack[-1] == "}":
+                stack.pop()
+            elif char == "]" and stack and stack[-1] == "]":
+                stack.pop()
+
+        while stack:
+            repaired += stack.pop()
+        return re.sub(r",(\s*[}\]])", r"\1", repaired)
+
+    def _recover_reference_pairs(self, text: str) -> Dict[str, str]:
+        recovered: Dict[str, str] = {}
+        pair_pattern = re.compile(
+            r'"(?P<key>ref_\d+)"\s*:\s*"(?P<value>(?:\\.|[^"\\])*)"',
+            flags=re.DOTALL,
+        )
+        for match in pair_pattern.finditer(text or ""):
+            try:
+                recovered[match.group("key")] = json.loads(f'"{match.group("value")}"')
+            except Exception:
+                recovered[match.group("key")] = match.group("value")
+        return recovered
+
     def _sanitize_extracted_reference(self, value: str) -> str:
         cleaned = (value or "").strip()
         if not cleaned:
@@ -1125,6 +1508,12 @@ class GradingService:
             raw_segments = normalized.split("\n")
 
         disallowed_markers = [
+            "ක්රියාකාරකම",
+            "ක්‍රියාකාරකම",
+            "à¶šà·Šà¶»à·’à¶ºà·à¶šà·à¶»à¶šà¶¸",
+            "පහත ප්රශ්න",
+            "පහත ප්‍රශ්න",
+            "විග්‍රහාත්මක රචනා ප්‍රශ්න",
             "ශී ලංකා ජාතික ගීය",
             "ගරු අධයාපන අමාත්යතුමාගේ පණිවුඩය",
             "තිළිණය ලෙසින් රජයෙන්",
@@ -1203,9 +1592,18 @@ class GradingService:
             return ""
 
         bm25 = BM25Okapi([c.split() for c in chunks])
-        top_chunks = bm25.get_top_n(search_query.split(), chunks, n=15)
-        top_chunks = [chunk for chunk in top_chunks if not self._is_placeholder_answer(chunk)]
-        context = "\n\n".join(top_chunks[:5])
+        ranked_chunks: List[str] = []
+        seen_chunks = set()
+        for query in self._build_reference_search_queries(
+            {"question_text": q_text, "display_number": q_number}
+        ):
+            top_chunks = bm25.get_top_n(query.split(), chunks, n=8)
+            for chunk in top_chunks:
+                if chunk in seen_chunks or self._is_placeholder_answer(chunk):
+                    continue
+                seen_chunks.add(chunk)
+                ranked_chunks.append(chunk)
+        context = "\n\n".join(ranked_chunks[:6])
 
         if len(context) > 2000:
             context = context[:2000] + "... [Context Clipped]"
@@ -1228,16 +1626,59 @@ class GradingService:
         if not context and syllabus_text:
             chunks = self._split_reference_source_chunks(syllabus_text)
             if chunks:
-                search_query = question_text or display_number
                 bm25 = BM25Okapi([c.split() for c in chunks])
-                top_chunks = bm25.get_top_n(search_query.split(), chunks, n=8)
-                top_chunks = [chunk for chunk in top_chunks if not self._is_placeholder_answer(chunk)]
-                context = "\n\n".join(top_chunks[:4])
+                ranked_chunks: List[str] = []
+                seen_chunks = set()
+                for query in self._build_reference_search_queries(question_info):
+                    top_chunks = bm25.get_top_n(query.split(), chunks, n=8)
+                    for chunk in top_chunks:
+                        if chunk in seen_chunks or self._is_placeholder_answer(chunk):
+                            continue
+                        seen_chunks.add(chunk)
+                        ranked_chunks.append(chunk)
+                context = "\n\n".join(ranked_chunks[:6])
 
         context = (context or "").strip()
         if len(context) > 2200:
             context = context[:2200] + "... [Context Clipped]"
         return context
+
+    def _build_reference_search_queries(self, question_info: Dict[str, Any]) -> List[str]:
+        raw_text = str(question_info.get("question_text") or "")
+        display_number = str(question_info.get("display_number") or "")
+        cleaned = re.sub(r"\([^)]*[A-Za-z0-9\[\]:/]{4,}[^)]*\)", " ", raw_text)
+        cleaned = re.sub(r"[^\w\s\u0D80-\u0DFF]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        queries = [f"{display_number} {cleaned}".strip(), cleaned]
+        lower = cleaned.lower()
+
+        topic_queries = []
+        if "1960" in lower and "භාෂා" in lower:
+            topic_queries.append("1960 රාජ්‍ය භාෂා සිංහල දෙමළ විශේෂ විධිවිධාන පනත")
+        if "1977" in lower and ("විවෘත" in lower or "ආර්ථික" in lower):
+            topic_queries.append("1977 විවෘත ආර්ථික ප්‍රතිපත්තිය පෞද්ගලික අංශය අපනයන ආනයන විදේශ ආයෝජන")
+        if "1972" in lower and "මූලික" in lower:
+            topic_queries.append("1972 මූලික අයිතිවාසිකම් නීතිය ඉදිරියේ සමානත්වය සිතීමේ නිදහස ආගමික නිදහස")
+        if "1978" in lower and "විධායක" in lower and "ජනාධිපති" in lower:
+            topic_queries.append("1978 විධායක ජනාධිපති අගමැති ජනාධිපති ධුරය")
+        if "බ්‍රිතාන්" in lower and "අවධානය" in lower:
+            topic_queries.append("බ්‍රිතාන්‍ය ශ්‍රී ලංකාව අවධානය ඉන්දියාව බෙංගාල බොක්ක ත්‍රිකුණාමලය කුරුඳු")
+        if "කෝල්බ" in lower and "ආර්ථික" in lower:
+            topic_queries.append("කෝල්බෲක් ආර්ථික අනිවාර්ය සේවා රාජකාරී රජයේ වෙළෙඳ ඒකාධිකාරය කුරුඳු ලුණු ඉඩම්")
+        if "වතු" in lower and ("ආර්ථික" in lower or "වගා" in lower):
+            topic_queries.append("වතු වගා ආර්ථිකය කෝපි තේ රබර් ඉන්දියානු ශ්‍රමිකයන් දුම්රිය මහාමාර්ග")
+        if "ඩොනමෝර්" in lower and ("සර්ව" in lower or "කාරක" in lower):
+            topic_queries.append("ඩොනමෝර් සර්වජන ඡන්ද බලය විධායක කාරක සභා රාජ්‍ය මන්ත්‍රණ සභාව")
+        if "සෝල්බ" in lower:
+            topic_queries.append("සෝල්බරි ආණ්ඩුක්‍රමය නිදහස අග්‍රාණ්ඩුකාර පාර්ලිමේන්තුව කැබිනට් මණ්ඩලය")
+        if "නිදහස්" in lower and "අධ්" in lower:
+            topic_queries.append("නිදහස් අධ්‍යාපන ප්‍රතිපත්තිය පාසල් විශ්වවිද්‍යාල අධ්‍යාපන")
+        if "විශ්වවිද්" in lower:
+            topic_queries.append("නව විශ්වවිද්‍යාල විද්‍යෝදය විද්‍යාලංකාර පේරාදෙණිය")
+
+        queries.extend(topic_queries)
+        return [query for query in self._dedupe_reference_items(queries) if query]
 
     def _sanitize_extracted_reference(self, value: str) -> str:
         cleaned = (value or "").strip()
@@ -1305,6 +1746,441 @@ class GradingService:
 
         return cleaned[:1500]
 
+    def _reference_value_to_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(
+                text
+                for text in (self._reference_value_to_text(item).strip() for item in value)
+                if text
+            )
+        if isinstance(value, dict):
+            priority_keys = [
+                "points",
+                "covering_points",
+                "key_points",
+                "answer",
+                "expected_answer",
+                "reference",
+                "reference_answer",
+            ]
+            parts: List[str] = []
+            for key in priority_keys:
+                if key in value:
+                    text = self._reference_value_to_text(value.get(key)).strip()
+                    if text:
+                        parts.append(text)
+            if parts:
+                return "\n".join(parts)
+            fallback_parts = []
+            for item in value.values():
+                text = self._reference_value_to_text(item).strip()
+                if text:
+                    fallback_parts.append(text)
+            return "\n".join(fallback_parts)
+        return str(value)
+
+    def _shape_reference_for_schema(self, value: Any, question_info: Dict[str, Any]) -> str:
+        raw_text = self._reference_value_to_text(value)
+        if self._is_invalid_schema_reference(raw_text, question_info):
+            return ""
+
+        cleaned = self._sanitize_extracted_reference(raw_text)
+        if not cleaned:
+            return ""
+        if self._is_invalid_schema_reference(cleaned, question_info):
+            return ""
+
+        if self._is_short_schema_question(question_info):
+            shaped = self._compact_short_reference(cleaned, question_info)
+            if not self._short_reference_satisfies_required_count(shaped, question_info):
+                return ""
+        else:
+            shaped = self._format_covering_points_reference(cleaned, question_info)
+
+        if self._is_invalid_schema_reference(shaped, question_info):
+            return ""
+        return shaped
+
+    def _is_invalid_schema_reference(self, text: str, question_info: Optional[Dict[str, Any]] = None) -> bool:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not cleaned:
+            return True
+
+        lowered = cleaned.lower()
+        invalid_markers = [
+            "not_found",
+            "not found",
+            "reference points for this question will appear here",
+            "will appear here",
+            "placeholder",
+            "[no matching evidence extracted]",
+        ]
+        if any(marker in lowered for marker in invalid_markers):
+            return True
+
+        if len(cleaned) <= 4 and cleaned.endswith("."):
+            return True
+        if re.fullmatch(r"(?:[A-Za-z\u0D80-\u0DFF]\.\s*){1,4}", cleaned):
+            return True
+        if re.search(r"(?:^|\s)[A-Za-z\u0D80-\u0DFF]\.$", cleaned):
+            return True
+
+        question_text = str((question_info or {}).get("question_text") or "")
+        if "විධායක ජනාධිපති" in question_text and "ගොපල්ලව" in cleaned:
+            return True
+        return False
+
+    def _is_short_schema_question(self, question_info: Dict[str, Any]) -> bool:
+        part_name = str(question_info.get("part_name") or "").lower()
+        question_type = str(question_info.get("question_type") or "").lower()
+        try:
+            max_marks = int(question_info.get("max_marks") or 0)
+        except (TypeError, ValueError):
+            max_marks = 0
+
+        if "paper_i" in part_name or "paper i" in part_name:
+            return True
+        if max_marks and max_marks <= 2:
+            return True
+        return question_type in {"short", "short_answer", "mcq"} and max_marks <= 2
+
+    def _compact_short_reference(self, text: str, question_info: Dict[str, Any]) -> str:
+        try:
+            max_marks = int(question_info.get("max_marks") or 1)
+        except (TypeError, ValueError):
+            max_marks = 1
+
+        required_items = self._required_short_answer_count(question_info, max_marks)
+        max_items = max(1, min(4, required_items or max_marks or 1))
+        limit = 180 if max_items == 1 else 260
+        items = self._split_reference_items(text)
+        if len(items) <= 1:
+            items = self._split_reference_sentences(text)
+            max_items = 1
+
+        if required_items == 1 and len(items) == 1 and self._question_explicitly_asks_one(question_info):
+            items = [self._first_single_answer_candidate(items[0])]
+
+        if not items:
+            return ""
+
+        compact_items = [
+            self._truncate_reference_item(self._strip_reference_item_marker(item), limit)
+            for item in items[:max_items]
+        ]
+        compact_items = [item for item in compact_items if item]
+        compact = "; ".join(compact_items).strip()
+        if len(compact) > limit:
+            compact = self._truncate_reference_item(compact, limit)
+        return compact
+
+    def _required_short_answer_count(self, question_info: Dict[str, Any], max_marks: int = 1) -> int:
+        text = re.sub(r"\s+", " ", str(question_info.get("question_text") or "")).lower()
+
+        if any(term in text for term in ["හතර", "හතරක්", "four"]):
+            return 4
+        if any(term in text for term in ["තුන", "තුනක්", "three"]):
+            return 3
+        if any(term in text for term in ["දෙක", "දෙකක්", "two"]):
+            return 2
+
+        asks_person_and_year = (
+            any(term in text for term in ["කවුද", "කවුරුන්", "who"])
+            and any(term in text for term in ["වර්ෂ", "වසර", "year"])
+        )
+        if asks_person_and_year:
+            return 2
+
+        asks_definition_and_aim = "යනු" in text and any(term in text for term in ["අරමුණ", "aim", "objective"])
+        if asks_definition_and_aim:
+            return 2
+
+        if any(term in text for term in ["එක්", "එකක්", "කවුද", "කුමක්ද", "කුමන", "one"]):
+            return 1
+
+        return max(1, min(3, max_marks or 1))
+
+    def _question_explicitly_asks_one(self, question_info: Dict[str, Any]) -> bool:
+        text = re.sub(r"\s+", " ", str(question_info.get("question_text") or "")).lower()
+        return any(term in text for term in ["එක්", "එකක්", "one"])
+
+    def _first_single_answer_candidate(self, text: str) -> str:
+        item = str(text or "").strip()
+        parts = [part.strip() for part in re.split(r"\s*,\s*", item) if part.strip()]
+        if len(parts) <= 1:
+            return item
+        first = parts[0]
+        if len(first) >= 8 and first.count("(") == first.count(")"):
+            return first
+        return item
+
+    def _short_reference_satisfies_required_count(self, text: str, question_info: Dict[str, Any]) -> bool:
+        if not text:
+            return False
+        required = self._required_short_answer_count(
+            question_info,
+            int(question_info.get("max_marks") or 1),
+        )
+        if required <= 1:
+            return True
+
+        question_text = str(question_info.get("question_text") or "")
+        if (
+            required == 2
+            and any(term in question_text for term in ["වර්ෂ", "වසර", "year"])
+            and re.search(r"\b(?:18|19|20)\d{2}\b", text)
+            and len(re.sub(r"\b(?:18|19|20)\d{2}\b", "", text).strip(" -:,;")) >= 5
+        ):
+            return True
+
+        count = self._reference_item_count(text)
+        return count >= required
+
+    def _reference_item_count(self, text: str) -> int:
+        items = self._split_reference_items(text)
+        if len(items) <= 1:
+            items = self._split_reference_sentences(text)
+        if len(items) <= 1 and "," in str(text or ""):
+            items = [part.strip() for part in str(text or "").split(",") if part.strip()]
+        return len([item for item in items if item])
+
+    def _format_covering_points_reference(self, text: str, question_info: Dict[str, Any]) -> str:
+        try:
+            max_marks = int(question_info.get("max_marks") or 4)
+        except (TypeError, ValueError):
+            max_marks = 4
+
+        max_points = max(3, min(8, max_marks or 4))
+        items = self._split_reference_items(text)
+        if len(items) <= 1:
+            items = self._split_reference_sentences(text)
+
+        cleaned_items = []
+        for item in items:
+            cleaned = self._truncate_reference_item(self._strip_reference_item_marker(item), 420)
+            if cleaned:
+                cleaned_items.append(cleaned)
+
+        cleaned_items = self._dedupe_reference_items(cleaned_items)[:max_points]
+        if not cleaned_items:
+            return ""
+        if len(cleaned_items) == 1:
+            return cleaned_items[0]
+        return "\n".join(f"{index}. {item}" for index, item in enumerate(cleaned_items, start=1))
+
+    def _split_reference_items(self, text: str) -> List[str]:
+        normalized = (text or "").replace("\r", "\n")
+        normalized = re.sub(r"\s*[;；]\s*", "\n", normalized)
+        normalized = re.sub(r"\s+(?=(?:\d{1,2}|[A-Za-z])[\.)]\s+)", "\n", normalized)
+        raw_items = [line.strip() for line in normalized.split("\n") if line.strip()]
+        return self._dedupe_reference_items(
+            self._strip_reference_item_marker(item)
+            for item in raw_items
+            if self._strip_reference_item_marker(item)
+        )
+
+    def _split_reference_sentences(self, text: str) -> List[str]:
+        normalized = re.sub(r"\s+", " ", text or "").strip()
+        if not normalized:
+            return []
+
+        dot_placeholder = "__REF_DOT__"
+        protected = re.sub(
+            r"(?<!\S)([A-Za-z\u0D80-\u0DFF]{1,4})\.",
+            lambda match: f"{match.group(1)}{dot_placeholder}",
+            normalized,
+        )
+        sentences = [
+            item.replace(dot_placeholder, ".").strip()
+            for item in re.split(r"(?<=[.!?\u0964])\s+", protected)
+            if item.strip()
+        ]
+        if len(sentences) <= 1 and len(normalized) > 220:
+            sentences = [item.strip() for item in re.split(r"\s*;\s*", normalized) if item.strip()]
+        return self._dedupe_reference_items(sentences)
+
+    def _strip_reference_item_marker(self, text: str) -> str:
+        cleaned = re.sub(
+            r"^\s*(?:[-*\u2022]+|\(?\d{1,2}\)?[\.)-]|\(?[A-Za-z]\)?[\.)-])\s*",
+            "",
+            str(text or ""),
+        ).strip()
+        cleaned = re.sub(
+            r"^(?:answer|expected answer|direct answer|reference answer|covering points?)\s*[:\-]\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    def _truncate_reference_item(self, text: str, limit: int) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        clipped = cleaned[:limit].rsplit(" ", 1)[0].strip()
+        return clipped.rstrip(" ,;:-")
+
+    def _dedupe_reference_items(self, items) -> List[str]:
+        seen = set()
+        unique_items: List[str] = []
+        for item in items:
+            cleaned = str(item or "").strip()
+            if not cleaned:
+                continue
+            key = re.sub(r"\s+", " ", cleaned).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_items.append(cleaned)
+        return unique_items
+
+    def _parse_reference_response_by_alias(self, data: Any, questions: List[Dict[str, Any]]) -> Dict[str, str]:
+        if isinstance(data, list):
+            merged = {}
+            for item in data:
+                if isinstance(item, dict):
+                    merged.update(item)
+            data = merged
+        if not isinstance(data, dict):
+            return {}
+
+        alias_to_uuid = {}
+        question_by_key = {}
+        for index, question in enumerate(questions, start=1):
+            idx_key = f"ref_{index}"
+            question_by_key[question["key"]] = question
+            for alias in self._build_reference_key_aliases(idx_key, question["display_number"]):
+                alias_to_uuid[alias] = question["key"]
+
+        result: Dict[str, str] = {}
+        for raw_key, value in data.items():
+            original_key = alias_to_uuid.get(self._normalize_reference_key(raw_key))
+            if not original_key:
+                logger.warning(f"[GEMINI_REF] Unexpected key in response: {raw_key}")
+                continue
+
+            text_value = self._reference_value_to_text(value).strip()
+            if not text_value or text_value.upper() == "NOT_FOUND":
+                logger.info(f"[GEMINI_REF] Key={original_key}: NOT_FOUND in syllabus")
+                continue
+
+            clean_val = self._shape_reference_for_schema(
+                text_value,
+                question_by_key.get(original_key, {}),
+            )
+            if clean_val:
+                result[original_key] = clean_val
+        return result
+
+    def _trim_reference_evidence_block(self, evidence: str, limit: int = 1400) -> str:
+        cleaned = re.sub(r"\n{3,}", "\n\n", (evidence or "").strip())
+        if not cleaned:
+            return ""
+        cleaned = cleaned.replace("[Context Clipped]", "").strip()
+        if len(cleaned) <= limit:
+            return cleaned
+
+        clipped = cleaned[:limit].rsplit("\n\n", 1)[0].strip()
+        if len(clipped) < int(limit * 0.6):
+            clipped = cleaned[:limit].rsplit(" ", 1)[0].strip()
+        return f"{clipped}\n[Evidence clipped]"
+
+    def _bounded_generate_missing_references(
+        self,
+        questions: List[Dict[str, Any]],
+        syllabus_text: str,
+        max_batches: Optional[int] = None,
+    ) -> Dict[str, str]:
+        if not questions or not syllabus_text.strip():
+            return {}
+
+        result: Dict[str, str] = {}
+        source = syllabus_text.strip()
+        full_source_for_fallback = ""
+        batch_size = 8
+        batches = [
+            questions[index:index + batch_size]
+            for index in range(0, len(questions), batch_size)
+        ]
+        if max_batches is not None:
+            batches = batches[:max(0, int(max_batches))]
+        if not batches:
+            return {}
+
+        for batch_index, batch in enumerate(batches, start=1):
+            prompt = """You are creating a golden marking schema from an uploaded Sinhala History syllabus/note.
+
+Your job is to provide the expected answer/covering points for the questions.
+
+STRICT RULES:
+1. First, try to extract the answer directly from the provided uploaded-source evidence.
+2. If the source does not support the question topic, you MUST write the correct answer using your expert knowledge of the subject.
+3. When using your expert knowledge, the answer MUST be fully accurate, hallucination-free, and appropriate for the subject and grade level.
+4. Paper I / 1-2 marks: direct short answer only. If the question asks for one item, return exactly one item. If it asks for two/three items, return exactly that many items.
+5. Paper II: covering points only, not essay prose.
+6. Ignore activities, paper instructions, page headers, and unrelated nearby topics.
+
+OUTPUT: valid JSON only, keyed by the provided ref_N keys.
+"""
+            if full_source_for_fallback:
+                prompt += "\n=== FULL UPLOADED SYLLABUS / NOTE SOURCE ===\n"
+                prompt += full_source_for_fallback
+                prompt += "\n=== END FULL SOURCE ===\n"
+                prompt += "Use the full source above and the focused evidence excerpts below.\n"
+            prompt += "\nQuestions needing bounded golden references:\n"
+
+            for index, question in enumerate(batch, start=1):
+                try:
+                    max_marks = int(question.get("max_marks") or 0)
+                except (TypeError, ValueError):
+                    max_marks = 0
+                evidence = self._trim_reference_evidence_block(
+                    self._build_reference_context_block(question, syllabus_text),
+                    limit=1800,
+                )
+                prompt += f"\n--- Key: ref_{index} ---\n"
+                prompt += f"Question Number: {question.get('display_number')}\n"
+                prompt += f"Paper Part: {question.get('part_name') or 'Unknown'}\n"
+                prompt += f"Question: {question.get('question_text')}\n"
+                prompt += f"Max Marks: {question.get('max_marks')}\n"
+                prompt += f"Required Style: {'covering points only' if max_marks > 2 else 'direct short answer only'}\n"
+                if max_marks <= 2:
+                    prompt += f"Required Answer Count: {self._required_short_answer_count(question, max_marks)}\n"
+                prompt += f"Uploaded Source Evidence:\n{evidence or '[no matching evidence extracted]'}\n"
+
+            try:
+                reason = (
+                    "bounded_golden_reference_fallback"
+                    if len(batches) == 1
+                    else f"bounded_golden_reference_fallback_{batch_index}_of_{len(batches)}"
+                )
+                response_json = gemini_generate_evaluation(
+                    prompt,
+                    budget=EvaluationGeminiClient.REFERENCE_SCHEMA,
+                    json_mode=True,
+                    reason=reason,
+                )
+                if not response_json:
+                    continue
+                data = self._safe_reference_json_loads(response_json)
+                batch_result = self._parse_reference_response_by_alias(data, batch)
+                if batch_result:
+                    result.update(batch_result)
+                    logger.info(
+                        "[GEMINI_REF] Bounded golden fallback batch %s/%s generated %s references.",
+                        batch_index,
+                        len(batches),
+                        len(batch_result),
+                    )
+            except Exception as exc:
+                logger.error(f"[GEMINI_REF] Bounded golden fallback batch %s failed: {exc}", batch_index)
+
+        logger.info("[GEMINI_REF] Bounded golden fallback generated %s references.", len(result))
+        return result
 
     def generate_initial_marking_scheme(
         self,
@@ -1400,18 +2276,19 @@ class GradingService:
         logger.info(f"[GEMINI_EXTRACTION] Starting extraction for {len(questions)} questions.")
         logger.info(f"[GEMINI_EXTRACTION] Syllabus text length: {len(syllabus_text)} chars.")
         if not syllabus_text.strip():
-            logger.warning("[GEMINI_EXTRACTION] SYLLABUS TEXT IS EMPTY! Gemini will fallback to generation mode.")
+            logger.warning("[GEMINI_EXTRACTION] SYLLABUS TEXT IS EMPTY; reference extraction will return no generated facts.")
 
-        base_prompt = """You are a Sinhala education expert. Your task is to READ the syllabus evidence provided for each question and EXTRACT the specific answer points that question is looking for.
+        base_prompt = """You are a Sinhala education expert. Your task is to READ the attached syllabus/note evidence and EXTRACT a marking schema for each question.
 
 IMPORTANT RULES:
-1. Use ONLY the syllabus evidence block given for that question.
-2. Do NOT use internal knowledge.
-3. Do NOT say "not covered", "not in the document", or similar phrases.
-4. If the evidence is partial, extract the closest useful answer points from that evidence anyway.
-5. For short-answer questions (1-2 marks): provide the exact expected answer in 1-2 Sinhala sentences.
+1. Try to extract answers primarily from the attached syllabus/note evidence provided in this prompt.
+2. If the evidence does not contain a usable answer, you MUST write the correct answer using your expert knowledge of the subject.
+3. When using your own knowledge, the answer MUST be fully accurate, hallucination-free, and appropriate for the grade level.
+4. Short-answer schema (Paper I / 1-2 marks): return only the direct expected answer words, name, date, place, event, or short facts. If the question asks for one item, return exactly one item. If it asks for two/three items, return exactly that many items. Do not write explanations or essay sentences.
+5. Paper II / essay-question schema: do NOT write a model essay. Return only the required covering points that the student answer should include, as a concise numbered list.
 6. Be SPECIFIC — extract or generate actual facts, names, dates, and concepts.
-7. Keep the answer grounded in the provided evidence. Do not add English explanations or meta commentary.
+6. Be SPECIFIC — extract or generate actual facts, names, dates, and concepts.
+7. Do not add English explanations or meta commentary.
 
 
 
@@ -1427,31 +2304,52 @@ OUTPUT FORMAT — return ONLY a valid JSON object:
 
 Questions:
 """
-        base_prompt = base_prompt.replace(
-            "extract or generate actual facts, names, dates, and concepts.",
-            "extract actual facts, names, dates, and concepts from the evidence block.",
-        )
-        base_prompt = base_prompt.replace(
-            'Do not add English explanations or meta commentary.\n',
-            'Do not add English explanations or meta commentary.\n8. If you cannot find a usable answer in the evidence, return the exact string "NOT_FOUND" for that key.\n',
-        )
+        # Removed replace calls to allow expert knowledge
+        base_prompt += """
+
+GOLDEN FALLBACK:
+- If an exact marking-answer sentence is not found, synthesize the expected reference using your expert knowledge.
+- You may combine multiple facts into a short answer or covering-point list.
+- Do not use unrelated activity text, page headers, paper instructions, or nearby but different topics.
+"""
+
+        full_syllabus_for_chunk = ""
 
         def process_chunk(chunk: List[Dict], chunk_index: int, total_chunks: int) -> Dict[str, str]:
             chunk_prompt = base_prompt
+            if full_syllabus_for_chunk:
+                chunk_prompt += (
+                    "\n=== ATTACHED SYLLABUS / NOTE SOURCE ===\n"
+                    f"{full_syllabus_for_chunk}\n"
+                    "=== END SYLLABUS / NOTE SOURCE ===\n"
+                    "Use this source for every question below.\n"
+                )
             # Robust mapping: index -> UUID
             index_to_uuid = {}
             alias_to_uuid = {}
+            question_by_key = {}
             for i, q in enumerate(chunk):
                 idx_key = f"ref_{i+1}"
                 index_to_uuid[idx_key] = q['key']
+                question_by_key[q["key"]] = q
                 for alias in self._build_reference_key_aliases(idx_key, q["display_number"]):
                     alias_to_uuid[alias] = q["key"]
-                evidence_block = self._build_reference_context_block(q, syllabus_text)
+                evidence_block = (
+                    "Use the attached syllabus/note source above."
+                    if full_syllabus_for_chunk
+                    else self._build_reference_context_block(q, syllabus_text)
+                )
+                if not full_syllabus_for_chunk:
+                    evidence_block = self._trim_reference_evidence_block(evidence_block, limit=1400)
                 chunk_prompt += f"\n--- Key: {idx_key} ---\n"
                 chunk_prompt += f"Question Number: {q['display_number']}\n"
+                chunk_prompt += f"Paper Part: {q.get('part_name') or 'Unknown'}\n"
                 chunk_prompt += f"Question: {q['question_text']}\n"
                 chunk_prompt += f"Max Marks: {q['max_marks']}\n"
                 chunk_prompt += f"Type: {'essay' if q['max_marks'] > 2 else 'short answer'}\n"
+                chunk_prompt += f"Required Schema Style: {'covering points only, not essay prose' if q['max_marks'] > 2 else 'direct short answer only'}\n"
+                if q["max_marks"] <= 2:
+                    chunk_prompt += f"Required Answer Count: {self._required_short_answer_count(q, q['max_marks'])}\n"
                 chunk_prompt += f"Evidence:\n{evidence_block or '[no matching evidence extracted]'}\n"
 
             try:
@@ -1471,7 +2369,7 @@ Questions:
                     r'^```json\s*|\s*```$', '', response_json.strip(), flags=re.MULTILINE
                 )
                 logger.info(f"[GEMINI_EXTRACTION] Raw Response for chunk: {clean_json}")
-                data = json.loads(clean_json)
+                data = self._safe_reference_json_loads(clean_json)
 
                 if isinstance(data, list):
                     merged = {}
@@ -1491,19 +2389,17 @@ Questions:
                             logger.warning(f"[GEMINI_REF] Unexpected key in response: {idx_key}")
                             continue
 
-                        if isinstance(value, str) and value.strip() and value.strip() != "NOT_FOUND":
-                            clean_val = self._sanitize_extracted_reference(value)
+                        text_value = self._reference_value_to_text(value)
+                        if text_value.strip() and text_value.strip().upper() != "NOT_FOUND":
+                            clean_val = self._shape_reference_for_schema(
+                                text_value,
+                                question_by_key.get(original_key, {}),
+                            )
                             if clean_val:
                                 result[original_key] = clean_val
                                 logger.info(
                                     f"[GEMINI_REF] Key={original_key}: extracted {len(clean_val)} chars"
                                 )
-                        elif isinstance(value, dict):
-                            # Handle if Gemini returns nested object
-                            text_val = value.get("answer", "") or value.get("points", "") or str(value)
-                            clean_val = self._sanitize_extracted_reference(text_val)
-                            if clean_val:
-                                result[original_key] = clean_val
                         else:
                             logger.info(f"[GEMINI_REF] Key={original_key}: NOT_FOUND in syllabus")
 
@@ -1512,13 +2408,6 @@ Questions:
                 missing_keys = [k for k in sent_uuids if k not in received_keys]
                 if missing_keys:
                     logger.warning(f"[GEMINI_REF] Missing UUIDs in response: {missing_keys}")
-                    for missing_key in missing_keys:
-                        question_info = next((q for q in chunk if q["key"] == missing_key), None)
-                        if not question_info:
-                            continue
-                        fallback_context = self._build_reference_context_block(question_info, syllabus_text)
-                        if fallback_context and not self._is_placeholder_answer(fallback_context):
-                            result[missing_key] = fallback_context
 
                 return result
 
@@ -1530,25 +2419,30 @@ Questions:
                 return {}
 
         max_requests = max(1, int(settings.EVAL_GEMINI_REFERENCE_SCHEMA_MAX_REQUESTS))
-        chunks: List[List[Dict]] = [[]]
-        current_chars = 0
-        max_chunk_chars = 2500
-        for question in questions:
-            evidence_preview = self._build_reference_context_block(question, syllabus_text)
-            estimated_chars = (
-                len(question.get("question_text", ""))
-                + len(evidence_preview or "")
-                + 300
-            )
-            if (
-                chunks[-1]
-                and current_chars + estimated_chars > max_chunk_chars
-                and len(chunks) < max_requests
-            ):
-                chunks.append([])
-                current_chars = 0
-            chunks[-1].append(question)
-            current_chars += estimated_chars
+        fallback_request_reserve = 2 if max_requests > 3 and len(questions) > 8 else 0
+        primary_request_limit = max(1, max_requests - fallback_request_reserve)
+        chunks: List[List[Dict]] = []
+        if full_syllabus_for_chunk:
+            chunks = [[]]
+            current_chars = 0
+            max_chunk_chars = 7000
+            for question in questions:
+                estimated_chars = len(question.get("question_text", "")) + 300
+                if (
+                    chunks[-1]
+                    and current_chars + estimated_chars > max_chunk_chars
+                    and len(chunks) < primary_request_limit
+                ):
+                    chunks.append([])
+                    current_chars = 0
+                chunks[-1].append(question)
+                current_chars += estimated_chars
+        else:
+            questions_per_chunk = max(1, (len(questions) + primary_request_limit - 1) // primary_request_limit)
+            chunks = [
+                questions[index:index + questions_per_chunk]
+                for index in range(0, len(questions), questions_per_chunk)
+            ]
 
         logger.info(
             "[GEMINI_REF] duty_name=reference_extraction request_budget=%s requests_used=%s fallback_used=%s reason=chunk_plan",
@@ -1571,7 +2465,22 @@ Questions:
                 except Exception as exc:
                     logger.error(f"[GEMINI_REF] Chunk extraction exception: {exc}")
 
-        logger.info(f"[GEMINI_REF] Total extracted: {len(all_refs)} references")
+        missing_for_golden = [
+            question
+            for question in questions
+            if question.get("key") and not all_refs.get(question.get("key"))
+        ]
+        if missing_for_golden and syllabus_text.strip():
+            remaining_requests = max(0, max_requests - len(chunks))
+            golden_refs = self._bounded_generate_missing_references(
+                missing_for_golden,
+                syllabus_text,
+                max_batches=remaining_requests,
+            )
+            if golden_refs:
+                all_refs.update(golden_refs)
+
+        logger.info("[GEMINI_REF] Total extracted references: %s", len(all_refs))
 
         # PERSISTENCE: Save extracted references to DB to heal missing context
         if all_refs:
@@ -1654,6 +2563,13 @@ Return ONLY a valid JSON object mirroring the keys provided.
             logger.error(f"[OCR_CLEAN] Failed to batch clean OCR: {e}")
             return mapped_answers
 
+    def _split_reference_concepts(self, reference_text: str) -> List[str]:
+        concepts = [
+            re.sub(r"\s+", " ", item).strip(" -:\t\r\n")
+            for item in re.split(r"[;；.!?\n।]+", str(reference_text or ""))
+        ]
+        return [concept for concept in concepts if len(concept) >= 4]
+
     def _calculate_coverage_score(self, student_text: str, reference_text: str, max_marks: int, student_emb=None):
         """
         Measures how many key concepts from the reference the student covered.
@@ -1670,8 +2586,7 @@ Return ONLY a valid JSON object mirroring the keys provided.
         if not reference_text:
             return 0.0, "No reference"
 
-        sentences = re.split(r"(?<=[.!?])\s+", reference_text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) >= 4]
+        sentences = self._split_reference_concepts(reference_text)
 
         if not sentences:
             return 0.0, "No reference sentences"
@@ -1688,9 +2603,11 @@ Return ONLY a valid JSON object mirroring the keys provided.
         sentence_embs = torch.stack([_embedding_cache[s] for s in sentences])
         sims = _cosine_util().cos_sim(s_emb, sentence_embs)[0]
 
-        # Threshold: how similar must a sentence be to count as "covered"
-        # Relaxed from 0.32 to 0.28 to reward pooled concise bullet items without dilution.
-        threshold = 0.28 if max_marks <= 2 else 0.28
+        # Threshold: how similar must a reference point be to count as covered.
+        # Paper II references are usually semicolon-separated covering points.
+        # Keep this stricter than topical similarity so merely writing around
+        # the same topic does not count as explaining every point.
+        threshold = 0.28 if max_marks <= 2 else 0.46
         hits = int((sims >= threshold).sum().item())
 
         # Cap the denominator to a fair expected concept count for this question.
@@ -1698,9 +2615,40 @@ Return ONLY a valid JSON object mirroring the keys provided.
         # for full coverage. The previous max_marks * 0.60 cap let 2-3 loose
         # matches count as perfect coverage and inflated Paper II scores.
         expected_concepts = min(len(sentences), max(1, max_marks))
+        if max_marks > 2:
+            expected_concepts = max(2, expected_concepts)
         ratio = hits / max(1, expected_concepts)
 
         return min(1.0, ratio), f"{hits}/{len(sentences)} concepts covered"
+
+    def _calculate_explanation_quality(self, student_text: str, reference_text: str, max_marks: int, coverage: float) -> float:
+        if max_marks <= 2:
+            return 1.0
+
+        student_words = re.findall(r"\w+", str(student_text or ""))
+        if not student_words:
+            return 0.0
+
+        concepts = self._split_reference_concepts(reference_text)
+        expected_concepts = max(1, min(len(concepts), max_marks))
+        words_per_expected_concept = len(student_words) / expected_concepts
+
+        explanation_markers = [
+            "නිසා", "හේතුවෙන්", "එමගින්", "මෙමගින්", "ඒ නිසා", "බලපෑ", "වැඩි",
+            "වර්ධනය", "දියුණු", "ඇති විය", "පිහිටුව", "ක්‍රියාත්මක", "හඳුන්වා",
+            "ලැබුණි", "කරන ලදී", "විය", "සඳහා", "තුළින්",
+        ]
+        marker_hits = sum(1 for marker in explanation_markers if marker in student_text)
+
+        if words_per_expected_concept >= 10 and marker_hits >= 2:
+            return 1.0
+        if words_per_expected_concept >= 7 and marker_hits >= 1:
+            return 0.90
+        if words_per_expected_concept >= 5:
+            return 0.78
+        if coverage >= 0.75:
+            return 0.70
+        return 0.60
 
 
     # ----------------------------------------------------------
@@ -1910,15 +2858,12 @@ Return ONLY a valid JSON object mirroring the keys provided.
 
         logger.info(f"[COVERAGE] {coverage_debug} -> coverage_ratio={coverage:.3f}")
 
-        # Recalibrated blend for Paper II (Fairness Update March 2026)
-        if coverage > 0.60:
-            # High quality answer: value concepts (coverage) and keywords (relevance) more
-            e_s_w, e_c_w, e_r_w = 0.40, 0.45, 0.15
-        else:
-            # Lower quality or vague: semantic topicality is the safeguard
-            e_s_w, e_c_w, e_r_w = 0.60, 0.30, 0.10
+        explanation = self._calculate_explanation_quality(student_text, reference_text, max_marks, coverage)
 
-        score = (e_s_w * semantic) + (e_c_w * coverage) + (e_r_w * relevance)
+        # Paper II should reward covered marking points and explanatory depth.
+        # Semantic similarity is only topicality; it must not overpower missing
+        # covering points from the confirmed schema.
+        score = (0.20 * semantic) + (0.55 * coverage) + (0.15 * relevance) + (0.10 * explanation)
 
         # Apply depth penalty for very short essays
         depth_mult = self._calculate_depth_penalty(student_text, reference_text, max_marks, coverage)
@@ -1930,7 +2875,8 @@ Return ONLY a valid JSON object mirroring the keys provided.
 
         logger.info(
             f"[ESSAY_SCORE] semantic={semantic:.3f} coverage={coverage:.3f} "
-            f"relevance={relevance:.3f} depth_mult={depth_mult:.2f} style_mult={style_mult:.2f} -> score={score:.3f}"
+            f"relevance={relevance:.3f} explanation={explanation:.3f} "
+            f"depth_mult={depth_mult:.2f} style_mult={style_mult:.2f} -> score={score:.3f}"
         )
 
         return float(score)
@@ -2121,7 +3067,7 @@ Questions to evaluate:
                 response_json = res_data.get("text") or "{}"
                 try:
                     clean_json = re.sub(r'^```json\s*|\s*```$', '', response_json.strip(), flags=re.MULTILINE)
-                    data = json.loads(clean_json)
+                    data = json.loads(clean_json, strict=False)
 
                     if isinstance(data, list):
                         merged_data = {}

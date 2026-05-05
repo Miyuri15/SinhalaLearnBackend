@@ -8,7 +8,7 @@ BASIC_TIER = "basic"
 INTERMEDIATE_TIER = "intermediate"
 ENTERPRISE_TIER = "enterprise"
 
-DEFAULT_TIER = BASIC_TIER
+DEFAULT_TIER = ENTERPRISE_TIER
 
 TIER_ALIASES: Dict[str, str] = {
     "normal": BASIC_TIER,
@@ -59,7 +59,7 @@ PRICING_PLANS: Dict[str, PricingPlan] = {
         note="No credit card required",
         limits=PlanLimits(
             learning_requests_per_hour=5,
-            evaluation_sessions_per_day=1,
+            evaluation_sessions_per_day=10,
             evaluations_per_session=10,
         ),
     ),
@@ -79,7 +79,7 @@ PRICING_PLANS: Dict[str, PricingPlan] = {
         note="Usage resets apply",
         limits=PlanLimits(
             learning_requests_per_hour=20,
-            evaluation_sessions_per_day=5,
+            evaluation_sessions_per_day=50,
             evaluations_per_session=None,
         ),
         is_popular=True,
@@ -100,7 +100,7 @@ PRICING_PLANS: Dict[str, PricingPlan] = {
         note="Usage resets apply",
         limits=PlanLimits(
             learning_requests_per_hour=50,
-            evaluation_sessions_per_day=10,
+            evaluation_sessions_per_day=100,
             evaluations_per_session=None,
             allow_evaluation_overage=True,
         ),

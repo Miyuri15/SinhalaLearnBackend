@@ -128,10 +128,13 @@ class EvaluationWorkflowService:
         return bool(configs) and all(bool(getattr(config, "is_confirmed", False)) for config in configs)
 
     def _can_reuse_question_paper_parse(self, chat_session_id: UUID, resource_id: UUID) -> bool:
-        if not self._chat_session_has_confirmed_paper_config(chat_session_id):
-            return False
         question_papers = self.question_papers.get_question_papers_by_chat_session(chat_session_id)
-        return any(getattr(qp, "resource_id", None) == resource_id for qp in question_papers)
+        for question_paper in question_papers:
+            if getattr(question_paper, "resource_id", None) != resource_id:
+                continue
+            if self.question_papers.get_questions_by_paper(question_paper.id):
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Ownership helpers
@@ -177,6 +180,37 @@ class EvaluationWorkflowService:
             raise ValueError("Answer document not found")
         self._get_eval_session_with_owner_check(answer_doc.evaluation_session_id, user_id)
         return answer_doc
+
+    def _collect_question_mapping_ids(self, questions: List[Question]) -> set[str]:
+        ids: set[str] = set()
+
+        def collect_sub_questions(sub_questions):
+            for sub_question in sub_questions or []:
+                ids.add(str(sub_question.id))
+                collect_sub_questions(getattr(sub_question, "children", []))
+
+        for question in questions or []:
+            ids.add(str(question.id))
+            collect_sub_questions(getattr(question, "sub_questions", []))
+
+        return ids
+
+    def _mapping_matches_current_questions(self, mapped_answers: Dict[str, Any], questions: List[Question]) -> bool:
+        if not mapped_answers:
+            return False
+        current_ids = self._collect_question_mapping_ids(questions)
+        if not current_ids:
+            return False
+        return all(str(key) in current_ids for key in mapped_answers.keys())
+
+    def _current_questions_for_session(self, evaluation_session_id: UUID) -> List[Question]:
+        eval_session = self.sessions.get_evaluation_session(evaluation_session_id)
+        if not eval_session:
+            return []
+        question_papers = self.question_papers.get_question_papers_by_chat_session(eval_session.session_id)
+        if not question_papers:
+            return []
+        return self.question_papers.get_questions_by_paper(question_papers[0].id)
 
     def _ensure_marking_schema_confirmed_for_session(self, session_id: UUID, user_id: UUID):
         return self.marking_schemas.ensure_schema_confirmed(session_id, user_id)
@@ -526,7 +560,14 @@ class EvaluationWorkflowService:
             rubric_id=payload.rubric_id,
         )
 
-    def process_documents(self, chat_session_id: UUID, answer_resource_ids: List[UUID], user_id: UUID):
+    def process_documents(
+        self,
+        chat_session_id: UUID,
+        answer_resource_ids: List[UUID],
+        user_id: UUID,
+        *,
+        force_reprocess: bool = False,
+    ):
         from app.schemas.evaluation import DocumentProcessingStatus, ProcessDocumentsResponse
         from app.shared.models.session_resources import SessionResource
         
@@ -650,17 +691,17 @@ class EvaluationWorkflowService:
             ).first()
             
             if qp_resource:
-                if self._can_reuse_question_paper_parse(chat_session_id, qp_resource.resource_id):
+                if not force_reprocess and self._can_reuse_question_paper_parse(chat_session_id, qp_resource.resource_id):
                     question_paper_ready = True
                     results.append(DocumentProcessingStatus(
                         resource_id=qp_resource.resource_id,
                         role="question_paper",
                         status="already_processed",
-                        message="Question paper already parsed and config confirmed."
+                        message="Question paper already parsed."
                     ))
                 else:
                     # Process QP
-                    self.parse_question_paper(chat_session_id, user_id)
+                    self.parse_question_paper(chat_session_id, user_id, force_reprocess=force_reprocess)
                     question_paper_ready = True
                     results.append(DocumentProcessingStatus(
                         resource_id=qp_resource.resource_id,
@@ -714,7 +755,13 @@ class EvaluationWorkflowService:
                 # Check if AnswerDocument exists for this session and resource
                 existing_ad = self.answers.get_answer_document_by_session_and_resource(session.id, res_id)
                 
-                if existing_ad and existing_ad.mapped_answers:
+                current_questions = self._current_questions_for_session(session.id)
+                can_reuse_mapping = bool(existing_ad and self._mapping_matches_current_questions(
+                    existing_ad.mapped_answers,
+                    current_questions,
+                ))
+
+                if existing_ad and can_reuse_mapping:
                      results.append(DocumentProcessingStatus(
                         resource_id=res_id,
                         role="answer_script",
@@ -731,6 +778,12 @@ class EvaluationWorkflowService:
                             student_identifier=f"Student-{res_id}"
                         )
                     
+                    if existing_ad and existing_ad.mapped_answers:
+                        logger.info(
+                            "Existing answer mapping for %s is stale after question-paper parsing. Remapping.",
+                            existing_ad.id,
+                        )
+
                     # Run parsing logic
                     self.parse_answer_document(existing_ad.id, user_id)
                     
@@ -754,7 +807,14 @@ class EvaluationWorkflowService:
         return ProcessDocumentsResponse(results=results)
 
 
-    def process_documents_generator(self, chat_session_id: UUID, answer_resource_ids: List[UUID], user_id: UUID):
+    def process_documents_generator(
+        self,
+        chat_session_id: UUID,
+        answer_resource_ids: List[UUID],
+        user_id: UUID,
+        *,
+        force_reprocess: bool = False,
+    ):
         """
         Generator that yields progress updates for document processing.
         Yields JSON strings formatted for SSE.
@@ -908,17 +968,17 @@ class EvaluationWorkflowService:
             
             status_obj = None
             if qp_resource:
-                if self._can_reuse_question_paper_parse(chat_session_id, qp_resource.resource_id):
+                if not force_reprocess and self._can_reuse_question_paper_parse(chat_session_id, qp_resource.resource_id):
                     question_paper_ready = True
                     status_obj = DocumentProcessingStatus(
                         resource_id=qp_resource.resource_id,
                         role="question_paper",
                         status="already_processed",
-                        message="Question paper already parsed and config confirmed."
+                        message="Question paper already parsed."
                     )
                 else:
                     logger.info("Stream: Parsing Question Paper...")
-                    self.parse_question_paper(chat_session_id, user_id)
+                    self.parse_question_paper(chat_session_id, user_id, force_reprocess=force_reprocess)
                     question_paper_ready = True
                     status_obj = DocumentProcessingStatus(
                         resource_id=qp_resource.resource_id,
@@ -981,8 +1041,14 @@ class EvaluationWorkflowService:
 
                 existing_ad = self.answers.get_answer_document_by_session_and_resource(session.id, res_id)
                 
+                current_questions = self._current_questions_for_session(session.id)
+                can_reuse_mapping = bool(existing_ad and self._mapping_matches_current_questions(
+                    existing_ad.mapped_answers,
+                    current_questions,
+                ))
+
                 status_obj = None
-                if existing_ad and existing_ad.mapped_answers:
+                if existing_ad and can_reuse_mapping:
                      status_obj = DocumentProcessingStatus(
                         resource_id=res_id,
                         role="answer_script",
@@ -996,6 +1062,11 @@ class EvaluationWorkflowService:
                             evaluation_session_id=session.id,
                             resource_id=res_id,
                             student_identifier=f"Student-{res_id}"
+                        )
+                    elif existing_ad.mapped_answers:
+                        logger.info(
+                            "Stream: Existing answer mapping for %s is stale after question-paper parsing. Remapping.",
+                            existing_ad.id,
                         )
                     
                     logger.info(f"Stream: Parsing Answer Script {res_id}...")
@@ -1088,7 +1159,7 @@ class EvaluationWorkflowService:
         self.resource_files.db.commit()
 
 
-    def parse_question_paper(self, session_id: UUID, user_id: UUID):
+    def parse_question_paper(self, session_id: UUID, user_id: UUID, *, force_reprocess: bool = False):
         """
         Parse question paper by extracting text and structuring content.
         Uses OCR if needed and AI-based content separation.
@@ -1107,24 +1178,26 @@ class EvaluationWorkflowService:
         if not session_resource:
             raise ValueError("No question paper resource attached to this chat session")
             
-        # Reuse parsed structure only after the user has confirmed the paper
-        # config. Before confirmation, repeated process clicks should refresh
-        # the generated structure/config instead of reporting stale completion.
+        # Reuse parsed structure for the same question-paper resource. Repeated
+        # process clicks should not recreate question UUIDs because that makes
+        # previously reviewed answer mappings stale and unstable.
         question_papers = self.question_papers.get_question_papers_by_chat_session(session_id)
         can_reuse_parsed_paper = self._can_reuse_question_paper_parse(
             session_id,
             session_resource.resource_id,
         )
-        if question_papers and can_reuse_parsed_paper:
+        if not force_reprocess and question_papers and can_reuse_parsed_paper:
             for qp in question_papers:
                 if getattr(qp, 'resource_id', None) == session_resource.resource_id:
                     logger.info(
-                        "Question paper already parsed and config confirmed. Reusing parsed structure."
+                        "Question paper already parsed for this resource. Reusing parsed structure."
                     )
                     return self.question_papers.get_question_paper_with_questions(qp.id)
+        elif force_reprocess and question_papers:
+            logger.info("Force reprocessing question paper for this resource.")
         elif question_papers:
             logger.info(
-                "Question paper has existing generated structure, but config is not confirmed. Reprocessing."
+                "Question paper has existing generated structure for a different or incomplete resource. Reprocessing."
             )
 
         self._ensure_resource_owner(session_resource.resource_id, user_id)
@@ -1365,21 +1438,13 @@ class EvaluationWorkflowService:
         eval_session = self._resolve_to_eval_session(session_id, user_id)
         return self.answers.get_answer_documents_by_evaluation_session(eval_session.id)
 
-    def parse_answer_document(self, answer_id: UUID, user_id: UUID):
+    def parse_answer_document(self, answer_id: UUID, user_id: UUID, *, force_remap: bool = False):
         """
         Parse and map student answers to questions without evaluating.
         Returns the mapping for verification.
         """
         logger.info(f"Parsing answer document {answer_id} for user {user_id}")
         answer_doc = self._ensure_answer_owner(answer_id, user_id)
-
-        # Check if already mapped
-        if answer_doc.mapped_answers:
-            return {
-                "answer_document_id": answer_id,
-                "extracted_text": None,
-                "mapped_answers": answer_doc.mapped_answers
-            }
 
         # Get the answer document with OCR text
         answer_resource = self.resource_files.get_resource(answer_doc.resource_id)
@@ -1402,6 +1467,20 @@ class EvaluationWorkflowService:
 
         question_paper = question_papers[0]
         questions = self.question_papers.get_questions_by_paper(question_paper.id)
+
+        # Reuse only mappings whose keys still belong to the current question
+        # hierarchy. Re-parsing a question paper recreates UUIDs, so old mapping
+        # payloads must be rebuilt instead of silently returned.
+        if not force_remap and self._mapping_matches_current_questions(answer_doc.mapped_answers, questions):
+            return {
+                "answer_document_id": answer_id,
+                "extracted_text": cleaned_answer_text,
+                "mapped_answers": answer_doc.mapped_answers
+            }
+        if force_remap and answer_doc.mapped_answers:
+            logger.info("Force remapping answer document %s.", answer_id)
+        elif answer_doc.mapped_answers:
+            logger.info("Existing mapped answers for %s are stale. Rebuilding mapping.", answer_id)
 
         # 2. Map answers
         answer_mapping = map_student_answers(cleaned_answer_text, questions)
@@ -1618,10 +1697,12 @@ class EvaluationWorkflowService:
         reference_map = self.marking_schemas.get_confirmed_reference_map(eval_session.id, user_id)
 
         # 1. Fix OCR errors in student answer
-        if answer_doc.mapped_answers:
+        if self._mapping_matches_current_questions(answer_doc.mapped_answers, questions):
             logger.info("Using existing answer mapping...")
             answer_mapping = answer_doc.mapped_answers
         else:
+            if answer_doc.mapped_answers:
+                logger.info("Existing answer mapping is stale for current question structure. Rebuilding...")
             # 2. Map answers to questions using AI
             if progress_callback:
                 progress_callback("processing_documents", "Mapping answers in one pass...")
@@ -1839,31 +1920,41 @@ class EvaluationWorkflowService:
         question_paper = question_papers[0]
         questions = self.question_papers.get_questions_by_paper(question_paper.id)
         
-        # Build Lookup
+        # Build part-aware lookup for display and sorting.
         lookup = {}
+        display_lookup = self._build_mapping_display_lookup(questions)
+
+        def add_subs(subs, parent_num, parent_question, part_name):
+            for sq in subs or []:
+                full_num = f"{parent_num}({sq.label})" if parent_num else str(sq.label)
+                lookup[str(sq.id)] = {
+                    "type": "sub_question",
+                    "number": full_num,
+                    "label": sq.label,
+                    "part": part_name,
+                    "display": display_lookup.get(str(sq.id), {}).get("display", f"{part_name} - {full_num}"),
+                    "sort_key": display_lookup.get(str(sq.id), {}).get("sort_key", ((99, ""), (10**9, full_num))),
+                    "text": sq.sub_question_text,
+                    "marks": sq.max_marks,
+                    "parent_id": str(parent_question.id)
+                }
+                add_subs(getattr(sq, "children", []) or [], full_num, parent_question, part_name)
+
         for q in questions:
+            part_name = str(getattr(q, "part_name", "") or "Unknown")
             lookup[str(q.id)] = {
                 "type": "question",
                 "number": q.question_number,
+                "part": part_name,
+                "display": display_lookup.get(str(q.id), {}).get("display", f"{part_name} - {q.question_number}"),
+                "sort_key": display_lookup.get(str(q.id), {}).get(
+                    "sort_key",
+                    (self._paper_part_sort_key(part_name), self._question_number_sort_key(q.question_number)),
+                ),
                 "text": q.question_text,
                 "marks": q.max_marks
             }
-            # Recursively add subquestions
-            def add_subs(subs, parent_num):
-                for sq in subs:
-                    full_num = f"{parent_num}({sq.label})" if parent_num else sq.label
-                    lookup[str(sq.id)] = {
-                        "type": "sub_question",
-                        "number": full_num,
-                        "label": sq.label,
-                        "text": sq.sub_question_text,
-                        "marks": sq.max_marks,
-                        "parent_id": str(q.id)
-                    }
-                    if sq.children:
-                        add_subs(sq.children, full_num)
-            
-            add_subs(q.sub_questions, q.question_number)
+            add_subs(getattr(q, "sub_questions", []) or [], q.question_number, q, part_name)
 
         # Combine
         details = []
@@ -1871,29 +1962,17 @@ class EvaluationWorkflowService:
             q_info = lookup.get(q_uuid, {"number": "Unknown", "text": "Unknown Question"})
             details.append({
                 "question_id": q_uuid,
+                "display_label": q_info.get("display", str(q_uuid)),
+                "paper_part": q_info.get("part", "Unknown"),
                 "question_number": q_info.get("number"),
                 "question_text": q_info.get("text"),
                 "student_answer": answer_text,
-                "max_marks": q_info.get("marks")
+                "max_marks": q_info.get("marks"),
+                "_sort_key": q_info.get("sort_key", ((99, ""), (10**9, str(q_uuid)))),
             })
-            
-        # Sort by question number (handles numbers and subparts like 10(a), 10(b), etc.)
-        import re
-        def question_sort_key(item):
-            text = item["question_number"] or ""
-            # Split into number and optional subpart, e.g., '10(a)' -> [10, 'a']
-            match = re.match(r"(\d+)(?:[. ]*\(?([a-zA-Z0-9]+)\)?)?", text)
-            if match:
-                num = int(match.group(1))
-                sub = match.group(2) or ""
-                # Try to convert sub to int if possible, else keep as string
-                try:
-                    sub_val = int(sub)
-                except (TypeError, ValueError):
-                    sub_val = sub.lower()
-                return (num, sub_val)
-            return (float('inf'), text)
 
-        details.sort(key=question_sort_key)
+        details.sort(key=lambda item: (item.get("_sort_key"), item.get("display_label", "")))
+        for item in details:
+            item.pop("_sort_key", None)
         
         return details

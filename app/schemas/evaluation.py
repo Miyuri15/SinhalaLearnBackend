@@ -1,6 +1,6 @@
 # app/schemas/evaluation.py
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Optional, Dict, List, Union, Any
 from uuid import UUID
 from datetime import datetime
@@ -69,6 +69,7 @@ class StartEvaluationRequest(BaseModel):
 class ProcessDocumentsRequest(BaseModel):
     chat_session_id: UUID
     answer_resource_ids: List[UUID]
+    force_reprocess: bool = False
 
 
 class DocumentProcessingStatus(BaseModel):
@@ -141,15 +142,17 @@ class EvaluationResourceResponse(BaseModel):
 
 # Paper Config Schemas
 class PaperConfigCreate(BaseModel):
-    paper_part: Optional[str] = None
+    model_config = ConfigDict(populate_by_name=True)
+
+    paper_part: Optional[str] = Field(default=None, validation_alias=AliasChoices("paper_part", "paperPart"))
     question_type: Optional[str] = None  # e.g., 'short', 'essay'
-    subject_name: Optional[str] = None
+    subject_name: Optional[str] = Field(default=None, validation_alias=AliasChoices("subject_name", "subjectName"))
     medium: Optional[str] = None
-    total_marks: Optional[int] = None
+    total_marks: Optional[int] = Field(default=None, validation_alias=AliasChoices("total_marks", "totalMarks"))
     weightage: Optional[Decimal] = None
-    total_main_questions: Optional[int] = None
-    selection_rules: Optional[Dict[str, Any]] = None
-    is_confirmed: Optional[bool] = False
+    total_main_questions: Optional[int] = Field(default=None, validation_alias=AliasChoices("total_main_questions", "totalMainQuestions"))
+    selection_rules: Optional[Dict[str, Any]] = Field(default=None, validation_alias=AliasChoices("selection_rules", "selectionRules"))
+    is_confirmed: Optional[bool] = Field(default=False, validation_alias=AliasChoices("is_confirmed", "isConfirmed"))
 
     def get_question_type(self):
         # Default: Paper/Part I = mcq, II = short, III = essay
@@ -167,15 +170,17 @@ class PaperConfigCreate(BaseModel):
 
 
 class PaperConfigUpdate(BaseModel):
-    paper_part: Optional[str] = None
+    model_config = ConfigDict(populate_by_name=True)
+
+    paper_part: Optional[str] = Field(default=None, validation_alias=AliasChoices("paper_part", "paperPart"))
     question_type: Optional[str] = None
-    subject_name: Optional[str] = None
+    subject_name: Optional[str] = Field(default=None, validation_alias=AliasChoices("subject_name", "subjectName"))
     medium: Optional[str] = None
-    total_marks: Optional[int] = None
+    total_marks: Optional[int] = Field(default=None, validation_alias=AliasChoices("total_marks", "totalMarks"))
     weightage: Optional[Decimal] = None
-    total_main_questions: Optional[int] = None
-    selection_rules: Optional[Dict[str, Any]] = None
-    is_confirmed: Optional[bool] = None
+    total_main_questions: Optional[int] = Field(default=None, validation_alias=AliasChoices("total_main_questions", "totalMainQuestions"))
+    selection_rules: Optional[Dict[str, Any]] = Field(default=None, validation_alias=AliasChoices("selection_rules", "selectionRules"))
+    is_confirmed: Optional[bool] = Field(default=None, validation_alias=AliasChoices("is_confirmed", "isConfirmed"))
 
 
 class PaperConfigResponse(BaseModel):
