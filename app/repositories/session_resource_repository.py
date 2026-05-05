@@ -98,3 +98,15 @@ class SessionResourceRepository:
         self.db.commit()
         return rows_deleted > 0
 
+
+
+    def get_resource_ids_by_session(self, session_id: UUID) -> List[str]:
+        """Retrieve all resource IDs associated with a given session as strings."""
+
+        results = (
+            self.db.query(SessionResource.resource_id)
+            .filter(SessionResource.session_id == session_id)
+            .all()
+        )
+
+        return [str(resource_id) for (resource_id,) in results]
