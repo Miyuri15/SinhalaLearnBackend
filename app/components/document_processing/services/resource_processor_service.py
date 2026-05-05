@@ -16,8 +16,32 @@ logger = logging.getLogger(__name__)
 class ResourceProcessorService:
     """Process stored resources through OCR, chunking, and embedding pipeline."""
 
-    def __init__(self, db: Session):
+    def __init__(
+        self,
+        db: Session,
+        text_type_classifier: Optional[Any] = None,
+        handwritten_ocr_predictor: Optional[Callable[[Any], str]] = None,
+        text_type_conf_threshold: float = 0.7,
+    ):
         self.db = db
+        self.text_type_classifier = text_type_classifier
+        self.handwritten_ocr_predictor = handwritten_ocr_predictor
+        self.text_type_conf_threshold = text_type_conf_threshold
+
+    def _resolve_ml_model_predict(self) -> Optional[Callable[[Any], tuple[str, float]]]:
+        """Normalize classifier instance into a callable(image) -> (label, confidence)."""
+        if self.text_type_classifier is None:
+            return None
+
+        if callable(self.text_type_classifier):
+            return self.text_type_classifier
+
+        predict = getattr(self.text_type_classifier, "predict", None)
+        if callable(predict):
+            return predict
+
+        logger.warning("Unsupported text type classifier; expected callable or object with .predict")
+        return None
 
     def _validate_resource_file(self, resource: ResourceFile):
         """Ensure resource file exists and is accessible."""
@@ -161,16 +185,35 @@ class ResourceProcessorService:
             
         print("➡️ Calling convert_file_to_images")
         images = convert_file_to_images(file_path, "pdf")
+        ml_model_predict = self._resolve_ml_model_predict()
 
         # Text classification
         if images:
             if progress_callback:
                 progress_callback("Classifying Text Type", 10.0, None)
 
-            detected_text_type = self._classify_first_image(images[0], classify_text_type)
+            detected_text_type, detected_confidence = self._classify_first_image(
+                images[0],
+                classify_text_type,
+                ml_model_predict=ml_model_predict,
+            )
+
+            if detected_text_type == "unknown" or detected_confidence < self.text_type_conf_threshold:
+                logger.info(
+                    "First-page text type low-confidence/unknown: %s (confidence=%.3f)",
+                    detected_text_type,
+                    detected_confidence,
+                )
 
             if progress_callback:
-                progress_callback("Text Type Detected", 11.0, {"text_type": detected_text_type})
+                progress_callback(
+                    "Text Type Detected",
+                    11.0,
+                    {
+                        "text_type": detected_text_type,
+                        "text_type_confidence": detected_confidence,
+                    },
+                )
 
         # Layout analysis decision
         if resource_type:
@@ -184,7 +227,12 @@ class ResourceProcessorService:
         extracted_text, page_count = process_ocr_for_images_with_tables(
             images,
             force_layout_analysis=force_layout,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            ml_model_predict=ml_model_predict,
+            ml_conf_threshold=self.text_type_conf_threshold,
+            trocr_predict=self.handwritten_ocr_predictor,
+            is_image_upload=False,
+            region_conf_threshold=self.text_type_conf_threshold,
         )
 
         if progress_callback:
@@ -224,11 +272,36 @@ class ResourceProcessorService:
         resource_type: Optional[str] = None,
         progress_callback: Optional[Callable[[str, float, Optional[Dict[str, Any]]], None]] = None
     ):
-        text_type = classify_text_type(file_path)
-        logger.info(f"Detected text type for image: {text_type}")
+        ml_model_predict = self._resolve_ml_model_predict()
+
+        text_type, text_type_confidence = classify_text_type(
+            file_path,
+            ml_model_predict=ml_model_predict,
+            ml_conf_threshold=self.text_type_conf_threshold,
+            return_confidence=True,
+        )
+        logger.info(
+            "Detected text type for image: %s (confidence=%.3f)",
+            text_type,
+            text_type_confidence,
+        )
+
+        if text_type == "unknown" or text_type_confidence < self.text_type_conf_threshold:
+            logger.info(
+                "Image text type is unknown/low confidence; OCR will use fallback behavior (label=%s, confidence=%.3f)",
+                text_type,
+                text_type_confidence,
+            )
 
         if progress_callback:
-                progress_callback("Text Type Detected", 37.0, {"text_type": text_type})
+                progress_callback(
+                    "Text Type Detected",
+                    37.0,
+                    {
+                        "text_type": text_type,
+                        "text_type_confidence": text_type_confidence,
+                    },
+                )
 
         images = convert_file_to_images(file_path, file_path.split('.')[-1])
 
@@ -241,7 +314,16 @@ class ResourceProcessorService:
             progress_callback("Layout Analysis", 35.0, None)
             progress_callback("Running OCR Extraction", 40.0, None)
 
-        extracted_text, page_count = process_ocr_for_images_with_tables(images, force_layout_analysis=force_layout, progress_callback=progress_callback)
+        extracted_text, page_count = process_ocr_for_images_with_tables(
+            images,
+            force_layout_analysis=force_layout,
+            progress_callback=progress_callback,
+            ml_model_predict=ml_model_predict,
+            ml_conf_threshold=self.text_type_conf_threshold,
+            trocr_predict=self.handwritten_ocr_predictor,
+            is_image_upload=True,
+            region_conf_threshold=self.text_type_conf_threshold,
+        )
 
         cleaned_text = basic_clean(extracted_text)
         
@@ -270,7 +352,12 @@ class ResourceProcessorService:
 
         return None, 0
 
-    def _classify_first_image(self, pil_image, classify_text_type):
+    def _classify_first_image(
+        self,
+        pil_image,
+        classify_text_type,
+        ml_model_predict: Optional[Callable[[Any], tuple[str, float]]] = None,
+    ):
         """
         Classify first page image as handwritten / printed without saving to disk.
         """
@@ -278,10 +365,19 @@ class ResourceProcessorService:
 
         img_np = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2GRAY)
 
-        text_type = classify_text_type(img_np)
+        text_type, text_type_confidence = classify_text_type(
+            img_np,
+            ml_model_predict=ml_model_predict,
+            ml_conf_threshold=self.text_type_conf_threshold,
+            return_confidence=True,
+        )
 
-        logger.info(f"Detected text type for PDF: {text_type}")
-        return text_type
+        logger.info(
+            "Detected text type for PDF: %s (confidence=%.3f)",
+            text_type,
+            text_type_confidence,
+        )
+        return text_type, text_type_confidence
     
     def _sniff_pdf_language(self, file_path, detect_language_from_text):
         """

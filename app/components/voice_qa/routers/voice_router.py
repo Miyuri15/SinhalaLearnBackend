@@ -51,11 +51,10 @@ logger = logging.getLogger(__name__)
 #     """
 #     return {"status": "Voice component is healthy."}
 
-
 @router.post("/transcribe")
 async def transcribe(
     audio: UploadFile = File(...),
-    resource_ids: Optional[str] = Form(None), # Added this
+    session_id: Optional[str] = Form(None),
     db: Session = Depends(get_db)
 ):
     temp_path = "temp.wav"
@@ -65,16 +64,29 @@ async def transcribe(
     # 1. Get raw transcription from Whisper
     raw_text = VoiceService.transcribe_audio(temp_path)
     
-    # 2. Fetch context hints from documents if resources exist
+    # 2. Use the Service layer to get resource IDs
     context_hints = ""
-    if resource_ids:
+    if session_id:
         try:
-            ids = [UUID(rid.strip()) for rid in resource_ids.split(",") if rid.strip()]
-            # Retrieve top 3-5 chunks that look like the raw text
-            top_chunks = retrieve_top_k(query=raw_text, resource_ids=ids, k=3)
-            context_hints = "\n".join([c.content for c in top_chunks])
+            # Initialize the Service instead of the Repository
+            service = SessionResourceService(db)
+            
+            # Fetch IDs through the Service
+            resource_ids = service.get_resource_ids_by_session(UUID(session_id))
+            
+            valid_uuids = [UUID(str(rid)) for rid in resource_ids]
+            
+            if resource_ids:
+                # Retrieve top 3-5 chunks using the list of IDs
+                top_chunks = retrieve_top_k(query=raw_text, resource_ids=valid_uuids, top_k=3)
+                
+                context_hints = "\n".join([c.get('text', '') for c in top_chunks])
+            else:
+                logger.warning(f"No resources found for session: {session_id}")
+                print(f"No resources found for session: {session_id}")
         except Exception as e:
             logger.error(f"Context retrieval failed: {e}")
+            
 
     # 3. Pass hints to the standardization service
     normalized, standard = VoiceService.standardize_southern_sinhala(raw_text, context_hints)

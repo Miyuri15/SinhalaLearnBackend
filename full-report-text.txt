@@ -1,0 +1,240 @@
+ 
+ABSTRACT 
+This research presents the document processing and embedding component of an AI-powered educational assistant for Sinhala learning resources. The component is designed to transform uploaded educational documents into clean, searchable, and semantically meaningful knowledge units that can support question answering, summarization, and automated evaluation workflows. It addresses the practical difficulty of processing Sinhala educational material that may appear as extractable PDFs, scanned documents, images, printed pages, handwritten responses, tables, or mixed Sinhala-English content.
+The implemented backend is built on FastAPI and processes stored resource files through a dedicated ResourceProcessorService. The pipeline validates PDF and image inputs, attempts direct text extraction for suitable PDFs using pdfplumber, and falls back to OCR when embedded text is unavailable, unreliable, or affected by legacy Sinhala font encodings. OCR processing uses OpenCV-based preprocessing with Tesseract language configuration, text type classification, lightweight language detection, YOLO-based table detection, and optional document layout analysis to preserve page structure, reading order, and table content.
+After extraction, the text is normalized using a cleaning layer and segmented into overlapping semantic chunks. The chunking strategy approximates token length, splits content at sentence boundaries, retains numbering metadata where available, and uses overlap between neighbouring chunks to preserve context across boundaries. This allows long educational resources to be represented as smaller passages suitable for retrieval while maintaining enough surrounding information for accurate downstream generation.
+The embedding component generates both document-level and chunk-level vector representations using Gemini embedding-001 with 768-dimensional output. Document embeddings are stored with the resource record to support fast first-stage filtering, while chunk embeddings are persisted with each ResourceChunk together with content length, chunk index, source character offsets, embedding model metadata, and generated pseudo-question hints. These vectors are stored in PostgreSQL with pgvector support, enabling semantic similarity search over the processed educational corpus.
+The resulting design supports retrieval-augmented learning and evaluation by combining document filtering, chunk-level dense retrieval, and lexical fallback mechanisms. At query time, uploaded resources can be narrowed through document embeddings and then searched at chunk level, allowing the assistant to ground responses in relevant Sinhala learning material rather than relying only on generic model knowledge. This implementation improves the usability of low-resource Sinhala documents by connecting OCR, layout-aware extraction, semantic chunking, vector storage, and retrieval into a single processing workflow.
+Keywords: Sinhala Document Processing, Optical Character Recognition (OCR), Document Layout Analysis, Table Detection, Semantic Chunking, Gemini Embeddings, pgvector, Retrieval-Augmented Generation, Low-Resource Language Processing
+
+1.	INTRODUCTION 
+1.1.	Background 
+The rapid advancement of Artificial Intelligence (AI) has significantly influenced the development of educational technologies, particularly in areas such as intelligent tutoring, automated assessment, resource-based question answering, and personalized learning. These systems rely heavily on Natural Language Processing (NLP), document understanding, information retrieval, and large language models to convert educational content into usable knowledge. However, many of these capabilities have been designed and evaluated mainly for high-resource languages such as English [5], [6], [9]. As a result, low-resource languages such as Sinhala still face practical barriers when AI systems need to process real classroom documents and provide reliable learning support.
+Sinhala is one of the official languages of Sri Lanka and a major medium of instruction in the national education system. Educational material in Sinhala appears in many forms, including textbooks, notes, question papers, marking schemes, scanned PDFs, images, tables, and student answer scripts. Although some of these resources are available digitally, many are still stored as scanned documents or images that cannot be searched or interpreted directly by AI systems. This creates a major limitation for educational assistants, because useful content must first be extracted, cleaned, structured, and converted into a representation that can support downstream reasoning and retrieval.
+A key challenge in this context is reliable text extraction. Some PDF documents contain embedded text that can be extracted directly, while others contain scanned pages, noisy images, mixed Sinhala-English content, or legacy Sinhala font encodings that produce unreadable text when extracted using conventional methods. Therefore, a practical Sinhala document processing system cannot depend on a single OCR strategy. It must validate the uploaded resource, identify when direct PDF extraction is suitable, and fall back to image-based OCR when the document structure or encoding makes embedded text unreliable.
+Document structure is also important in educational content. Headings, question numbers, paragraphs, tables, and page order affect how students and teachers understand a document. Conventional OCR pipelines often flatten these structures into plain text, which can reduce the meaning of examination papers, structured notes, and tabular learning resources. For this reason, layout-aware processing and table detection are important components of document intelligence. In the implemented system, OCR is supported by image preprocessing, language and text-type checks, YOLO-based table detection, and optional layout analysis so that extracted content better reflects the original educational resource.
+Text extraction alone is not sufficient for intelligent learning applications. If extracted text is stored only as plain strings, the system can perform basic keyword matching but cannot reliably retrieve content based on meaning. Semantic embeddings address this limitation by converting documents and text chunks into high-dimensional vector representations that capture contextual similarity. In this project, extracted Sinhala educational content is cleaned, divided into overlapping semantic chunks, and embedded using Gemini embedding-001. Both document-level and chunk-level embeddings are stored so that the system can first identify relevant resources and then retrieve the most relevant passages within them.
+The use of PostgreSQL with pgvector enables these embeddings to be searched efficiently through vector similarity operations. This supports retrieval-augmented generation, where the assistant responds to user questions using relevant content from uploaded Sinhala resources rather than relying only on general model knowledge. The implementation also supports fallback retrieval strategies, such as lexical matching, to improve robustness when embeddings are unavailable or when exact document terms are important.
+Overall, the integration of document processing and semantic embedding for Sinhala represents an important step toward practical AI-assisted education in low-resource language settings. By connecting resource validation, OCR fallback, layout-aware extraction, text cleaning, semantic chunking, vector storage, and retrieval, the system transforms unstructured educational documents into searchable and reusable knowledge units. This provides the foundation for resource-based question answering, summarization, and automated evaluation within an AI-powered educational assistant for Sinhala learning resources. 
+1.2.	Research Gap 
+Despite the rapid advancement of document processing and Natural Language Processing (NLP), several limitations remain when these technologies are applied to Sinhala educational resources. Existing tools are often designed around high-resource languages and clean digital text, while Sinhala classroom materials frequently appear as scanned PDFs, mobile-captured images, mixed Sinhala-English documents, tables, answer sheets, and legacy-encoded files. This creates a gap between general-purpose OCR or NLP systems and the practical requirements of Sinhala educational document understanding.
+One major gap is the lack of adaptive extraction pipelines that can choose between direct PDF text extraction and OCR fallback. Many systems assume that a PDF contains reliable embedded text, but Sinhala documents may contain scanned pages or legacy font encodings that produce unreadable output when extracted directly. Conversely, applying OCR to every document can be slower and may reduce quality when clean embedded text is already available. A practical system therefore needs a resource-aware processing flow that validates file type, detects language or encoding issues, and selects the most appropriate extraction path.
+Another gap is the weak preservation of document structure during OCR. Educational documents rely heavily on page boundaries, question numbering, headings, paragraphs, and tables. Traditional OCR pipelines often return plain continuous text, causing structural information to be lost or mixed together. This is especially problematic for question papers, marking schemes, and tabular resources where layout affects meaning. There is a need for integrated layout-aware processing that combines OCR with table detection and reading-order reconstruction rather than treating these tasks as isolated steps.
+A further gap exists in the way extracted Sinhala educational content is prepared for retrieval. Many document systems store extracted text as a single block or as loosely separated pages, which makes it difficult to retrieve precise evidence for question answering or evaluation. Long documents must be divided into meaningful chunks that preserve enough context across boundaries. Without semantic chunking, overlap handling, and metadata such as chunk order or source offsets, downstream retrieval can return incomplete or poorly grounded context.
+There is also a gap in embedding-based retrieval for Sinhala educational workflows. Although vector search has become common in modern AI systems, many Sinhala-focused document processing approaches do not combine document-level embeddings with chunk-level embeddings. Searching every chunk directly can be inefficient as the resource collection grows, while relying only on document-level similarity is too coarse for accurate question answering. A two-stage retrieval design is needed, where document embeddings first identify relevant resources and chunk embeddings then locate the most useful passages.
+Finally, existing approaches often lack robust fallback mechanisms when semantic retrieval is insufficient. Educational queries may include exact terms, question numbers, or phrases that are better handled through lexical matching than dense vectors alone. A practical Sinhala educational assistant therefore requires hybrid retrieval that can combine semantic similarity with lexical fallback, improving reliability across different types of user questions and document content.
+Therefore, the research gap addressed by this work is the absence of an integrated Sinhala document processing and embedding component that connects adaptive text extraction, layout and table awareness, semantic chunking, document-level embeddings, chunk-level embeddings, pgvector-based storage, and retrieval fallback strategies within a single educational assistant workflow. Addressing this gap enables Sinhala learning resources to be transformed from unstructured files into searchable, reusable, and context-aware knowledge units. 
+1.3.	Research Problem 
+Although Artificial Intelligence (AI) has been successfully applied to education in many languages, Sinhala educational resources still remain difficult to use in AI-driven learning systems because they are often stored as unstructured files rather than searchable knowledge sources. Existing document processing approaches do not consistently handle the variety of Sinhala educational inputs, including extractable PDFs, scanned documents, mobile-captured images, mixed Sinhala-English content, tables, question papers, answer sheets, and legacy-encoded Sinhala text. This makes it difficult to extract reliable text while preserving the structure and context needed for learning and evaluation.
+As a result, current systems often fail to provide a complete pipeline that converts Sinhala documents into semantically searchable representations. Extracted text may be inaccurate, flattened, poorly segmented, or stored without meaningful vector representations. This limits the effectiveness of downstream applications such as resource-based question answering, summarization, intelligent search, and automated evaluation. The central problem is therefore not only OCR accuracy, but the absence of an integrated document processing and embedding workflow that connects extraction, cleaning, chunking, vector storage, and retrieval in a way that is suitable for Sinhala educational content.
+Thus, the core research problem is: 
+How can Sinhala educational documents in diverse formats be accurately processed, structurally preserved, semantically chunked, and transformed into document-level and chunk-level embeddings that support reliable retrieval-augmented educational applications such as question answering, summarization, and automated evaluation?  
+3.	METHODOLOGY 
+3.1.	Workflow Description 
+The proposed methodology for Sinhala Document Processing and Embedding consists of four major phases: data collection, preprocessing and OCR, embedding generation, and system evaluation. 
+1.	Data Collection 
+•	Printed Sinhala documents will be gathered from textbooks, examination papers, and academic notes used in Sri Lankan schools. 
+•	Handwritten documents will be collected from student answer sheets, classroom notes, and controlled handwriting samples. 
+•	A balanced dataset will be curated to include variations in font styles, handwriting patterns, and document quality (e.g., scanned copies, images with noise). 
+2.	Preprocessing and OCR Development 
+•	Image Preprocessing: Apply noise removal, binarization, skew correction, and segmentation to improve recognition accuracy. 
+•	OCR for Printed Text: Adapt open-source OCR tools (e.g., Tesseract with Sinhala-trained data) to handle modern Sinhala fonts. 
+•	OCR for Handwriting: Investigate deep learning-based models (CNN/CRNN architectures) trained or fine-tuned on Sinhala handwriting datasets. 
+•	Text Normalization: Standardize Unicode encodings, resolve ligature inconsistencies, and normalize spacing for downstream processing. 
+3.	OCR Correction
+•	SinLlama OCR Correction: Use SinLlama, a Sinhala-specific model, to correct and normalize the OCR outputs, ensuring accurate recognition of Sinhala text (including handwritten content). This model will handle noise, spelling variations, and grammar issues typical in Sinhala documents. 
+•	Context-Aware Error Correction: SinLlama will improve accuracy by addressing the unique linguistic features of Sinhala, providing a context-aware solution for both printed and handwritten text. 
+4.	Sinhala Embedding Generation 
+•	Corpus Development: Construct a digital Sinhala text corpus using collected OCR outputs and supplementary online resources (educational websites, ebooks, etc.). 
+•	Embedding Models: Fine-tune SinBERT, a Sinhala-specific transformer-based model, to generate high-quality semantic embeddings for Sinhala. This model will capture the grammar, dialects, and cultural context of Sinhala text, enabling more accurate semantic representations compared to multilingual models.
+•	Semantic Representation: Evaluate embeddings on tasks such as synonym detection, sentence similarity, and cross-dialect understanding. 
+5.	Integration Framework 
+•	Develop a unified processing pipeline that links OCR outputs (corrected by SinLlama) to SinBERT embeddings, creating searchable and semantically meaningful representations of Sinhala documents. 
+•	Online Mode: Cloud-hosted for scalability and faster processing. 
+•	Offline Mode: Lightweight local deployment with compressed models for low-resource school environments. 
+6.	System Evaluation 
+•	OCR Evaluation: Use accuracy, character error rate (CER), and word error rate (WER) metrics on both printed and handwritten datasets to assess the performance of the OCR pipeline, including the SinLlama correction.
+•	Embedding Evaluation: Assess the quality of SinBERT embeddings using metrics such as cosine similarity, intrinsic word similarity tasks, and extrinsic evaluations on question answering or document retrieval tasks.
+•	User Testing: Pilot in selected schools (urban and rural) to test usability, accessibility, and performance under real classroom conditions. 
+The overall workflow of the proposed Sinhala Document Processing and Embedding methodology is illustrated in Figure 1. 
+  
+Figure 1 Workflow of the Sinhala Document Processing and Embedding methodology 
+3.2.	Tools and Technologies 
+3.2.1.	OCR and Image Processing 
+•	Tesseract OCR -For printed Sinhala text recognition. 
+•	OpenCV -For preprocessing tasks such as noise removal, binarization, skew correction, and segmentation. 
+•	Custom CNN/CRNN Models (PyTorch/TensorFlow) -For recognizing handwritten Sinhala text. 
+•	EasyOCR -As a lightweight alternative OCR engine supporting Sinhala, useful for rapid prototyping. 
+3.2.2.	Natural Language Processing (NLP) 
+•	NLTK / SpaCy -For text preprocessing (tokenization, stop-word removal, POS tagging). 
+•	Indic NLP Library -For handling script-specific challenges such as Unicode normalization, compound words, and ligatures in Sinhala. 
+•	Sinhala WordNet (if available) -For synonym and semantic relationship mapping. 
+3.2.3.	Embedding Models 
+•	Word2Vec / FastText -To generate word-level embeddings for Sinhala documents. 
+•	Multilingual BERT (mBERT) -To capture semantic meaning and contextual variations in Sinhala text. 
+•	Sentence Transformers (SBERT) -For sentence-level embeddings to support semantic search and similarity scoring. 
+•	SinBERT - A Sinhala-specific language model that outperforms multilingual embeddings (like mBERT) in capturing the nuances of Sinhala text and is better suited for semantic understanding in educational applications.
+3.2.4.	Machine Learning & Deep Learning Frameworks 
+•	TensorFlow and PyTorch -For training and fine-tuning models for OCR, embeddings, and downstream NLP tasks. 
+•	Hugging Face Transformers -For integration with pre-trained multilingual language models such as mBERT and XLM-R. 
+3.2.5.	Storage & Indexing 
+•	SQLite -Lightweight local database for storing embeddings in offline mode. 
+•	FAISS / Annoy -Vector similarity search libraries for efficient retrieval of embeddings. 
+•	Firebase / AWS S3 -Cloud storage and synchronization in online mode. 
+3.2.6.	Development & Deployment Tools 
+•	Python -Primary programming language for OCR, NLP, and embeddings. 
+•	Jupyter Notebook / Google Colab -For experimentation and prototyping. 
+•	Docker -For containerized deployment ensuring consistency across environments. 
+•	Flutter (Mobile App Integration) -For embedding retrieval and access on mobile devices. 
+ 
+3.3.	Timeline and Tasks 
+ 
+Figure 2 Project Timeline (Gantt Chart) 
+4.	PROJECT REQUIREMENTS 
+The successful implementation of the Sinhala Document Processing and Embedding framework requires a clear definition of functional and non-functional requirements, as well as expected test cases that verify system behavior under real-world conditions. 
+4.1.	Functional Requirements 
+The system will deliver the following essential functionalities: 
+1.	Accept Sinhala educational resources in both printed and handwritten formats (PDFs, images, and scanned student answer sheets). 
+2.	Perform document preprocessing operations such as noise removal, skew correction, and binarization to enhance OCR accuracy. 
+3.	Recognize Sinhala text through Optical Character Recognition (OCR) for both printed and handwritten inputs. followed by SinLlama-based OCR correction for improved accuracy, especially for noisy and handwritten content
+4.	Normalize extracted text into a standardized Sinhala Unicode representation to ensure consistency. 
+5.	Generate semantic embeddings using SinBERT, a Sinhala-specific language model, for improved contextual understanding and representation of Sinhala text.
+6.	Store embeddings in SQLite for offline mode and in Firebase/FAISS for cloud-based retrieval in online mode. 
+7.	Provide search and retrieval capabilities based on semantic similarity (using SinBERT embeddings) rather than exact keyword matches. This enables more intelligent and context-aware document retrieval. 
+8.	Operate seamlessly in both online (cloud-hosted) and offline (local device) environments. 
+9.	Support integration with the AI-Powered Educational Assistant platform to enable downstream tasks such as intelligent search and automated evaluation. 
+4.2.	Non-Functional Requirements 
+In addition to core functionality, the system must satisfy the following quality attributes: 
+1.	Accuracy - OCR accuracy of at least 85% for printed Sinhala and 75% for handwritten Sinhala. 
+2.	Performance - Document processing should complete within 5 seconds per printed page and 10 seconds per handwritten page on mid-range devices. 
+3.	Scalability - Cloud mode should support batch processing of textbooks containing more than 100 pages. 
+4.	Portability - The system should operate on Android mobile devices. 
+5.	Reliability - Offline mode must work without internet connectivity, ensuring previously processed data remains usable. 
+6.	Usability - Provide a simple, user-friendly interface suitable for educators and students with minimal technical expertise. 
+7.	Security - Data stored in SQLite (offline) must remain private, while cloud storage (Firebase/AWS) must enforce secure authentication. 
+4.3.	Expected Test Cases 
+To validate the requirements, the expected test cases are summarized in Table 1. 
+Table 1: Expected Test Cases for the Sinhala Document Processing and Embedding 
+Component 
+Test 
+Case 	Input 	Expected Output 	Requirement 
+Verified 
+TC1 	Upload a printed 
+Sinhala PDF 	Extracted text with ≥ 85% accuracy 	Functional Req. 
+1, 3 
+TC2 	Upload a handwritten 
+Sinhala answer sheet 	Extracted text with ≥ 75% accuracy 	Functional Req. 
+3 
+TC3 	Upload a lowquality/noisy scan 	Preprocessed image with normalized Sinhala text 	Functional Req. 
+2, 4 
+TC4 	Enter search query 
+"ගුරු" (teacher) 	Retrieve semantically related documents (e.g., 
+"ගුරුවරයා") 	Functional Req. 
+5, 7 
+TC5 	Run the system in offline mode 	Embeddings stored in SQLite and searchable locally 	Functional Req. 
+8 
+TC6 	Run the system in online mode 	Embeddings stored in Firebase/FAISS with fast retrieval 	Functional Req. 
+6, 8 
+TC7 	Process a 100-page Sinhala textbook in cloud mode 	Completed within 5 minutes 	Non-Functional 
+Req. 3 
+TC8 	Process one handwritten page on a mid-range phone 	Completed within 10 seconds 	Non-Functional 
+Req. 2 
+TC9 	Retrieve previously stored embeddings 	Consistent retrieval in both offline and online modes 	Functional Req. 
+6, 7 
+5.	DESCRIPTION OF PERSONNEL AND FACILITIES 
+5.1.	Personnel 
+This component of the research is conducted individually by Hasindu Koshitha Ranaweera (Student ID: IT22234452), an undergraduate student in the B.Sc. (Hons) in Information Technology program at the Sri Lanka Institute of Information Technology (SLIIT). 
+The researcher is responsible for every stage of the Sinhala Document Processing and Embedding module, including: 
+•	Designing the document ingestion pipeline to handle both scanned Sinhala educational resources and handwritten materials. 
+•	Implementing OCR solutions (Tesseract and CNN/CRNN models) for printed and handwritten Sinhala text recognition and SinLlama for OCR correction of both printed and handwritten Sinhala text.
+•	Preprocessing extracted text using normalization, tokenization, and stopword removal techniques tailored for the Sinhala language with SinLlama handling advanced normalization and ligature correction.
+•	Developing semantic embedding strategies using SinBERT to create high-quality, contextually aware searchable vector representations of Sinhala text, capturing the linguistic nuances of Sinhala grammar, dialects, and syntax.
+•	Designing and deploying an embedding storage and retrieval system using SQLite for offline mode and FAISS/Firebase for online mode. 
+•	Ensuring smooth integration of the Sinhala Document Processing pipeline into the AI-Powered Educational Assistant platform. 
+The project is supervised by Prof. Dilshan De Silva (Supervisor) and Ms. Chamali Pabasara (Co-Supervisor), who provide expertise in OCR, low-resource NLP, and document embedding strategies. 
+5.2.	Facilities 
+The research utilizes a combination of personal and institutional facilities to simulate both development and deployment in real-world educational environments. 
+•	Computing Devices - A personal laptop with sufficient memory and processing power is used as the primary development environment. Additional devices (a secondary laptop and an Android smartphone) are used to test OCR accuracy, embedding retrieval, and offline functionality in mobile contexts. 
+•	Internet Connectivity - Development and training make use of home and university Wi-Fi connections for accessing online datasets, running cloud-based experiments, and synchronizing embeddings. Offline scenarios are simulated to ensure system functionality in rural schools with poor connectivity. 
+•	Software and Development Tools 
+•	OCR: Tesseract OCR, EasyOCR, OpenCV. 
+•	NLP & Embeddings: Hugging Face Transformers, Indic NLP Library, FastText, mBERT, Sentence-BERT, sinBERT
+•	Deep Learning Frameworks: PyTorch and TensorFlow for model training and fine-tuning. 
+•	Storage & Indexing: SQLite for offline embedding storage; FAISS and Firebase for cloud-based retrieval. 
+•	Annotation & Preprocessing: Label Studio for dataset annotation, Python-based text preprocessing scripts. 
+•	Collaboration and Version Control - A private GitHub repository is used for code versioning and collaboration. 
+•	Google Colab Pro provides GPU resources for OCR model experimentation and embedding training.
+•	Microsoft Teams and Google Drive are used for communication and progress sharing with supervisors.
+By combining these resources with the researcher’s technical expertise, this project ensures the development of a robust Sinhala Document Processing and Embedding system that operates effectively in both online and offline modes, thereby supporting practical deployment in diverse Sri Lankan educational settings. 
+ 	  
+6.	BUDGET AND JUSTIFICATION 
+The budget for this component is minimal since most tools are open-source and existing personal/university devices are adequate. 
+6.1.	Estimated Budget 
+Table 2. Estimated Budget for the Sinhala Document Processing and Embedding Component 
+Item 	Description 	Estimated Cost (LKR) 
+Google Colab Pro 	GPU access for OCR fine-tuning and embedding experiments (USD 9.99 × 12 months) 	39,600 
+Software & Tools 	Free and open-source: 
+Tesseract OCR, 
+EasyOCR, Hugging Face 
+Transformers, PyTorch, ONNX Runtime, Scikitlearn, SQLite, Label 
+Studio 	0 
+Hardware 	No new devices purchased. Personal laptop and smartphone 
+used for testing Sinhala 
+OCR models 	0 
+Internet 	Covered by existing home and university WiFi connections 	0 
+Contingency 	Minor costs (printing, data storage, dataset annotation support) 	5,000 
+ 
+Total Estimated Cost: LKR 44,600 (≈ USD 150 for one year) 
+6.2.	Justification Summary 
+•	GPU Access: Sinhala OCR and embeddings require computational resources. Google Colab Pro will provide affordable GPU support for training/fine-tuning. University lab GPUs will be used for heavy experiments. 
+•	Software & Tools: Open-source OCR frameworks (Tesseract, EasyOCR), deep learning libraries (PyTorch, Hugging Face Transformers), and database tools (SQLite) ensure zero licensing cost. 
+•	Hardware: Personal laptop and university lab PCs are sufficient for training and testing. Mobile device used for field-level testing. 
+•	Data Annotation: Sinhala document dataset annotation is necessary for OCR accuracy and embedding quality. Most annotation will be done by the researcher; a small contingency budget is kept for outsourcing quality checks. 
+•	Cost Efficiency: By leveraging free/open-source tools and existing devices, this component maintains a very low cost while still supporting advanced OCR + embedding research. 
+7.	CONCLUSION 
+The proposed Sinhala Document Processing and Embedding component is a crucial step toward bridging the digital divide in Sri Lanka’s education system. By enabling the digitization of both printed and handwritten Sinhala materials and converting them into semantic embeddings, this research directly addresses the lack of linguistic resources that has historically limited AI applications in Sinhala education. 
+The integration of OCR with embedding generation ensures that educational content can be represented and retrieved not merely as text, but as meaningful semantic information. This foundation empowers downstream applications such as semantic search, question answering, and automated evaluation, which are essential to modern learning environments. Furthermore, the system’s dual online-offline capability guarantees inclusivity by serving both resource-rich urban schools and rural institutions with limited connectivity. 
+The methodology’s reliance on open-source tools, lightweight storage systems, and affordable compute resources ensures both academic feasibility and practical scalability. By combining technical innovation with a focus on accessibility, this component establishes a sustainable framework for Sinhala educational digitization. 
+Ultimately, the successful completion of this project will provide Sri Lankan educators and learners with tools previously limited to resource-rich languages, fostering equitable access to AI-powered educational technologies and setting the groundwork for future innovations in Sinhala Natural Language Processing 
+ 	 
+ 
+REFERENCES 
+[1]	C. Vasantharajan, L. Tharmalingam, and U. Thayasivam, “Adapting the Tesseract 
+Open Source OCR Engine for Tamil and Sinhala Legacy Fonts and Creating a Parallel Corpus for Tamil Sinhala English,” in Proc. 2022 Int. Conf. on Asian Language Processing (IALP), Singapore, Oct. 2022, pp. 143-149, doi: 
+10.1109/IALP57159.2022.9961304. [Online]. Available: https://ieeexplore.ieee.org/document/9961304 
+ 
+[2]	J. V. Francis and Y. L. Bellanavithana, “SinhaLearn: NLP, CNN, and OCR Based 
+Data Driven Approach for Enhancing Sinhala Proficiency of Grade 5 Scholarship Students,” in Proc. 2024 Moratuwa Engineering Research Conf. (MERCon), Moratuwa, Sri Lanka, Aug. 2024, pp. 536-541, doi: 
+10.1109/MERCon63886.2024.10689004. [Online]. Available: https://ieeexplore.ieee.org/document/10689004 
+ 
+[3]	A. Liyanage, S. Ranathunga, and S. Jayasena, “Bilingual Lexical Induction for 
+Sinhala English using Cross Lingual Embedding Spaces,” in Proc. 2021 Moratuwa Engineering Research Conf. (MERCon), Moratuwa, Sri Lanka, Jul. 2021, pp. 579584, doi: 10.1109/MERCon52712.2021.9525667. [Online]. Available: https://ieeexplore.ieee.org/document/9525667 
+ 
+[4]	C. Jeeva, T. Porselvi, B. Krithika, R. Shreya, G. S. Priyaa, and K. Sivasankari, 
+“Intelligent Image Text Reader using EasyOCR, NRCLex & NLTK,” in Proc. 2022 
+Int. Conf. on Power, Energy, Control and Transmission Systems (ICPECTS), 
+Chennai, India, 2022, pp. 1-6, doi: 10.1109/ICPECTS56089.2022.10047136. 
+[Online]. Available: https://ieeexplore.ieee.org/document/10047136 
+ 
+[5]	R. Smith, “An Overview of the Tesseract OCR Engine,” in Proc. Int. Conf. on Document Analysis and Recognition (ICDAR), Curitiba, Brazil, 2007, pp. 629-633. doi: 10.1109/ICDAR.2007.4376991. [Online]. Available: https://ieeexplore.ieee.org/document/4376991 
+ 
+[6]	M. Jaderberg, K. Simonyan, A. Vedaldi, and A. Zisserman, “Synthetic Data and Artificial Neural Networks for Natural Scene Text Recognition,” arXiv preprint arXiv:1406.2227, 2014. [Online]. Available: https://arxiv.org/abs/1406.2227 
+ 
+[7]	T. Mikolov, K. Chen, G. Corrado, and J. Dean, “Efficient Estimation of Word 
+Representations in Vector Space,” arXiv preprint arXiv:1301.3781, 2013. [Online]. Available: https://arxiv.org/abs/1301.3781 
+ 
+[8]	P. Bojanowski, E. Grave, A. Joulin, and T. Mikolov, “Enriching Word Vectors with Subword Information,” Trans. Assoc. Comput. Linguistics (TACL), vol. 5, pp. 135-146, 2017. [Online]. Available: https://arxiv.org/abs/1607.04606 
+ 
+[9]	J. Devlin, M. W. Chang, K. Lee, and K. Toutanova, “BERT: Pre-training of Deep 
+Bidirectional Transformers for Language Understanding,” in Proc. Conf. of the North 
+American Chapter of the Association for Computational Linguistics: Human 
+Language Technologies (NAACL-HLT), Minneapolis, USA, Jun. 2019, pp. 41714186. [Online]. Available: https://arxiv.org/abs/1810.04805 
+ 
+[10]	N. Reimers and I. Gurevych, “Sentence-BERT: Sentence Embeddings using 
+Siamese BERT-Networks,” in Proc. Conf. on Empirical Methods in Natural 
+Language Processing (EMNLP), Hong Kong, China, Nov. 2019, pp. 3982-3992. [Online]. Available: https://arxiv.org/abs/1908.10084 
+ 
+[11]	J. Johnson, M. Douze, and H. Jégou, “Billion-Scale Similarity Search with GPUs,” IEEE Trans. Big Data, vol. 7, no. 3, pp. 535-547, 2021, doi: 
+10.1109/TBDATA.2019.2921572. [Online]. Available: 
+https://ieeexplore.ieee.org/document/8733051 
+ 	 
