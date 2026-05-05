@@ -3,8 +3,7 @@ name: Azure Backend CI/CD
 on:
   push:
     branches:
-      - feat/deployment_fixes
-      - Feat/deployment_fixes
+      - main
   workflow_dispatch:
 
 env:
