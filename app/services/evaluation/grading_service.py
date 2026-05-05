@@ -406,7 +406,12 @@ class GradingService:
                 missing_reference_keys.append(str(key))
 
         if missing_reference_keys:
-            raise ValueError("Marking schema must be confirmed before grading")
+            logger.warning(
+                "Confirmed marking schema is missing reference text for %s mapped answer(s); "
+                "falling back to retrieved context for keys=%s",
+                len(missing_reference_keys),
+                missing_reference_keys[:20],
+            )
 
         # -------------------------------------------------------
         # PHASE 0.5: Pre-calculate all embeddings (SPEEDUP)
