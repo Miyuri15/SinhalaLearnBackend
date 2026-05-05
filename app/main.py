@@ -24,6 +24,12 @@ class OriginLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         origin = request.headers.get("origin")
         logger.info("Incoming request - Origin: %s, Method: %s, Path: %s", origin, request.method, request.url.path)
+        if request.method == "OPTIONS":
+            try:
+                headers_dict = dict(request.headers)
+            except Exception:
+                headers_dict = {k: v for k, v in request.headers}
+            logger.info("OPTIONS request headers: %s", headers_dict)
         response = await call_next(request)
         return response
 
@@ -43,6 +49,9 @@ app = FastAPI(
     swagger_ui_parameters={"persistAuthorization": True},
 )
 
+# Register origin logging middleware before CORS so we capture preflight requests
+app.add_middleware(OriginLoggingMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -50,9 +59,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Add origin logging middleware after CORS
-app.add_middleware(OriginLoggingMiddleware)
 
 app.include_router(websockets.router)
 app.include_router(api_router, prefix="/api/v1")
