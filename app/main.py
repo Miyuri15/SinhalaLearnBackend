@@ -23,7 +23,7 @@ cors_origins = [
     "http://localhost:64792",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://web.sinhalalearn.online/auth/sign-up",
+    "https://web.sinhalalearn.online",
 ]
 
 if settings.FRONTEND_URL and settings.FRONTEND_URL not in cors_origins:
