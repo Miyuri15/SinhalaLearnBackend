@@ -5,8 +5,9 @@ from app.logging_config import setup_logging
 setup_logging()
 
 import logging
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.base import BaseHTTPMiddleware
 from fastapi.openapi.utils import get_openapi
 from app.routers import (
     websockets,
@@ -18,6 +19,13 @@ from app.core.config import settings
 from app.core.database import Base, engine
 
 logger = logging.getLogger(__name__)
+
+class OriginLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+        logger.info("Incoming request - Origin: %s, Method: %s, Path: %s", origin, request.method, request.url.path)
+        response = await call_next(request)
+        return response
 
 cors_origins = [
     "http://localhost:64792",
@@ -43,12 +51,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add origin logging middleware after CORS
+app.add_middleware(OriginLoggingMiddleware)
+
 app.include_router(websockets.router)
 app.include_router(api_router, prefix="/api/v1")
 
 @app.on_event("startup")
 def on_startup():
     logger.info("Starting Sinhala Educational Assistant API...")
+    logger.info("Allowed CORS origins: %s", cors_origins)
 
     try:
         Base.metadata.create_all(bind=engine)
