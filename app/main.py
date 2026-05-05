@@ -7,7 +7,7 @@ setup_logging()
 import logging
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.openapi.utils import get_openapi
 from app.routers import (
     websockets,
