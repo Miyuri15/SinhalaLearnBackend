@@ -11,6 +11,7 @@ from app.services.message_context_service import MessageContextService
 from app.services.message_service import MessageService
 from app.utils.sinhala_prompt_builder import build_qa_prompt, build_direct_answer_prompt
 from app.utils.sinhala_summary_prompt_builder import build_summary_prompt
+from app.utils.sinhala_explanation_prompt_builder import build_explanation_prompt
 from app.utils.sinhala_safety_engine import concept_map_check, detect_misconceptions, attach_evidence
 from app.services.message_safety_service import MessageSafetyService
 from app.core.gemini_client import GeminiClient
@@ -25,7 +26,7 @@ class RAGService:
     """RAG orchestration with hybrid retrieval, grounded generation, and safety checks."""
     
     # Threshold for considering retrieved content relevant
-    RELEVANCE_THRESHOLD = 0.20  # Lowered to reduce false negatives; LLM will handle the final gate.
+    RELEVANCE_THRESHOLD = 0.20
 
 
     def __init__(self, db: Session):
@@ -247,7 +248,7 @@ class RAGService:
 
         # 🟡 Explanation fallback
         elif intent == "explanation":
-            prompt = build_direct_answer_prompt(
+            prompt = build_explanation_prompt(
                 context=context,
                 query=user_query,
                 grade=grade_level,
