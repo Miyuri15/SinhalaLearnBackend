@@ -34,12 +34,19 @@ if _api_keys:
 else:
     logger.warning("No Gemini API key found. Set GOOGLE_API_KEY and optionally GOOGLE_API_KEY_V2.")
 
-MODEL_NAME = "gemini-2.5-flash"
+# MODEL_NAME = "gemini-2.5-flash"
+# MODEL_FALLBACKS = [
+#     MODEL_NAME,
+#     "gemini-2.0-flash",
+#     "gemini-2.5-pro",
+#     "gemini-2.5-flash-lite",
+# ]
+
+MODEL_NAME = "gemini-3.8-live"
+
 MODEL_FALLBACKS = [
     MODEL_NAME,
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash-native-audio-preview-12-2025",
 ]
 _active_model_index = 0
 _model_index_lock = threading.Lock()

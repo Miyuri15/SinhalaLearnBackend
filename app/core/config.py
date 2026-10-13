@@ -7,7 +7,20 @@ class Settings(BaseSettings):
     APP_NAME: str = "Sinhala Educational Assistant"
     ENV: str = "development"
 
-    # Gemini
+    # # Gemini
+    # GOOGLE_API_KEY: Optional[str] = None
+    # GOOGLE_API_KEY_V2: Optional[str] = None
+    # GEMINI_API_KEY: Optional[str] = None
+    # GEMINI_LIGHT_API_KEY: Optional[str] = None
+    # EVAL_GEMINI_OCR_CORRECTION_MAX_REQUESTS: int = 1
+    # EVAL_GEMINI_ANSWER_MAPPING_MAX_REQUESTS: int = 10
+    # EVAL_GEMINI_REFERENCE_SCHEMA_MAX_REQUESTS: int = 10
+    # EVAL_GEMINI_OCR_MODEL: str = "gemini-2.5-flash"
+    # EVAL_GEMINI_QUESTION_PARSING_MODEL: str = "gemini-2.5-flash"
+    # EVAL_GEMINI_ANSWER_MAPPING_MODEL: str = "gemini-2.5-flash"
+    # EVAL_GEMINI_REFERENCE_SCHEMA_MODEL: str = "gemini-2.5-flash"
+
+        # Gemini
     GOOGLE_API_KEY: Optional[str] = None
     GOOGLE_API_KEY_V2: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
@@ -15,10 +28,11 @@ class Settings(BaseSettings):
     EVAL_GEMINI_OCR_CORRECTION_MAX_REQUESTS: int = 1
     EVAL_GEMINI_ANSWER_MAPPING_MAX_REQUESTS: int = 10
     EVAL_GEMINI_REFERENCE_SCHEMA_MAX_REQUESTS: int = 10
-    EVAL_GEMINI_OCR_MODEL: str = "gemini-2.5-flash"
-    EVAL_GEMINI_QUESTION_PARSING_MODEL: str = "gemini-2.5-flash"
-    EVAL_GEMINI_ANSWER_MAPPING_MODEL: str = "gemini-2.5-flash"
-    EVAL_GEMINI_REFERENCE_SCHEMA_MODEL: str = "gemini-2.5-flash"
+    EVAL_GEMINI_OCR_MODEL: str = "gemini-3.8-live"
+    EVAL_GEMINI_QUESTION_PARSING_MODEL: str = "gemini-3.8-live"
+    EVAL_GEMINI_ANSWER_MAPPING_MODEL: str = "gemini-3.8-live"
+    EVAL_GEMINI_REFERENCE_SCHEMA_MODEL: str = "gemini-3.8-live"
+
 
     # Database (optional)
     DATABASE_URL: Optional[str] = None
